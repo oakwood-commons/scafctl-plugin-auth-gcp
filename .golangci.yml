@@ -1,0 +1,19 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - gosec
+    - misspell
+
+  exclusions:
+    rules:
+      - linters:
+          - gosec
+        path: _test\.go
+        text: "G101|G117"
