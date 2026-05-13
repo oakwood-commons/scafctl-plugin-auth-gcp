@@ -43,6 +43,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-catalog:
+    outputs:
+      image_ref: ${{ steps.push.outputs.image_ref }}
     name: Publish Catalog Artifact
     needs: release
     runs-on: ubuntu-latest
@@ -61,6 +63,9 @@ jobs:
           tar xzf "${TMP_DIR}"/scafctl_*_Linux_x86_64.tar.gz -C "${TMP_DIR}"
           sudo mv "${TMP_DIR}/scafctl" /usr/local/bin/scafctl
           rm -rf "${TMP_DIR}"
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@6da1ae018866400525525ce74ff892880c099987 # v0.5
 
       - name: Login to GitHub Container Registry
         run: |
@@ -99,13 +104,17 @@ jobs:
           fi
 
       - name: Build and push catalog artifact
+        id: push
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
           BINARY="scafctl-plugin-auth-gcp"
+          NAME="gcp"
+          CATALOG="ghcr.io/oakwood-commons"
+          IMAGE="${CATALOG}/auth-handlers/${NAME}"
 
           scafctl build plugin \
             --force \
-            --name "gcp" \
+            --name "${NAME}" \
             --kind "auth-handler" \
             --version "${VERSION}" \
             --platform "linux/amd64=dist/${BINARY}-linux-amd64" \
@@ -115,13 +124,29 @@ jobs:
             --platform "windows/amd64=dist/${BINARY}-windows-amd64.exe"
 
           scafctl catalog push \
-            "gcp@${VERSION}" \
-            --catalog "oci://ghcr.io/oakwood-commons" \
+            "${NAME}@${VERSION}" \
+            --catalog "oci://${CATALOG}" \
             --kind "auth-handler" \
             --force
 
+          # Resolve the pushed manifest digest for cosign signing
+          DIGEST=$(crane digest "${IMAGE}:${VERSION}")
+          echo "image_ref=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
       - name: Refresh catalog index
         run: |
+          CATALOG="ghcr.io/oakwood-commons"
           mkdir -p ~/.docker
           echo -n '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64)"'"}}}' > ~/.docker/config.json
-          scafctl catalog index push --catalog "oci://ghcr.io/oakwood-commons"
+          scafctl catalog index push --catalog "oci://${CATALOG}"
+
+  sign:
+    name: Sign OCI Artifact
+    needs: publish-catalog
+    if: needs.publish-catalog.outputs.image_ref != ''
+    permissions:
+      id-token: write
+      packages: write
+    uses: oakwood-commons/scafctl/.github/workflows/sign-plugin.yml@sign-plugin/v1
+    with:
+      image-ref: ${{ needs.publish-catalog.outputs.image_ref }}
