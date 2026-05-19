@@ -228,19 +228,7 @@ func (p *Plugin) GetStatus(ctx context.Context, handlerName string) (*auth.Statu
 
 	// Check for stored credentials (ADC flow)
 	if !p.secretExists(ctx, SecretKeyMetadata) {
-		// Check for gcloud ADC credentials as fallback
-		if HasGcloudADCCredentials() {
-			return &auth.Status{
-				Authenticated: true,
-				Claims: &auth.Claims{
-					Issuer: "https://accounts.google.com",
-					Name:   "gcloud ADC (application default credentials)",
-				},
-				IdentityType: auth.IdentityTypeUser,
-			}, nil
-		}
-
-		// Check metadata server availability without requiring prior login
+		// Check metadata server first -- matches acquireSourceToken priority order.
 		if p.isMetadataServerAvailable(ctx) {
 			return &auth.Status{
 				Authenticated: true,
@@ -249,6 +237,34 @@ func (p *Plugin) GetStatus(ctx context.Context, handlerName string) (*auth.Statu
 					Name:   "GCE/GKE metadata server",
 				},
 				IdentityType: auth.IdentityTypeServicePrincipal,
+			}, nil
+		}
+
+		// Check for gcloud ADC credentials as fallback.
+		// validateGcloudADCCredentials drives the control flow directly, avoiding the
+		// double file I/O of HasGcloudADCCredentials() + validateGcloudADCCredentials().
+		// ErrNotAuthenticated means no ADC is configured -- fall through to not-authenticated.
+		if tokenErr := p.validateGcloudADCCredentials(ctx); tokenErr == nil {
+			return &auth.Status{
+				Authenticated: true,
+				Claims: &auth.Claims{
+					Issuer: "https://accounts.google.com",
+					Name:   "gcloud ADC (application default credentials)",
+				},
+				IdentityType: auth.IdentityTypeUser,
+			}, nil
+		} else if !errors.Is(tokenErr, ErrNotAuthenticated) {
+			// ADC credentials exist but validation failed (e.g., expired, revoked, unreadable).
+			lgr := logr.FromContextOrDiscard(ctx)
+			lgr.V(1).Info("gcloud ADC credential validation failed", "error", tokenErr)
+			reason := "failed to validate gcloud ADC credentials"
+			var invalidErr *gcloudADCInvalidCredentialsError
+			if errors.As(tokenErr, &invalidErr) {
+				reason = "gcloud ADC credentials are invalid; run 'gcloud auth application-default login' to re-authenticate"
+			}
+			return &auth.Status{
+				Authenticated: false,
+				Reason:        reason,
 			}, nil
 		}
 

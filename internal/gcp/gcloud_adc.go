@@ -26,28 +26,41 @@ import (
 const (
 	// EnvCloudSDKConfig is the environment variable for custom gcloud config directory.
 	EnvCloudSDKConfig = "CLOUDSDK_CONFIG"
+
+	// defaultGcloudADCScope is the canonical scope used when caching gcloud ADC tokens
+	// on the login path (tokenResp.Scope fallback) and for the status validation probe.
+	// Using the same constant in both places maximises cache hit rate for the common case.
+	defaultGcloudADCScope = "https://www.googleapis.com/auth/cloud-platform"
 )
 
 // ErrNoGcloudADCConfigured is returned when no gcloud ADC credentials are configured.
 var ErrNoGcloudADCConfigured = errors.New("no gcloud ADC credentials configured")
 
+// gcloudADCInvalidCredentialsError represents a definitive authentication failure (e.g.,
+// expired or revoked credentials) as opposed to a transient network or server error.
+type gcloudADCInvalidCredentialsError struct {
+	msg string
+}
+
+func (e *gcloudADCInvalidCredentialsError) Error() string { return e.msg }
+
 // formatGcloudTokenError converts a raw OAuth error response into a clear, actionable error.
 func formatGcloudTokenError(errResp TokenErrorResponse, binaryName string) error {
 	if errResp.Error == "invalid_grant" {
 		if strings.Contains(errResp.ErrorDescription, "invalid_rapt") {
-			return fmt.Errorf(
+			return &gcloudADCInvalidCredentialsError{msg: fmt.Sprintf(
 				"gcloud ADC credentials require re-authentication (invalid_rapt): "+
 					"a security policy requires you to reauthenticate. "+
-					"Run: %s auth login %s",
+					"Run: gcloud auth application-default login OR %s auth login %s --flow interactive",
 				binaryName, HandlerName,
-			)
+			)}
 		}
-		return fmt.Errorf(
+		return &gcloudADCInvalidCredentialsError{msg: fmt.Sprintf(
 			"gcloud ADC credentials have expired or been revoked (%s). "+
-				"Run: %s auth login %s",
+				"Run: gcloud auth application-default login OR %s auth login %s --flow interactive",
 			errResp.ErrorDescription,
 			binaryName, HandlerName,
-		)
+		)}
 	}
 	return fmt.Errorf("gcloud ADC token refresh failed: %s - %s", errResp.Error, errResp.ErrorDescription)
 }
@@ -178,7 +191,7 @@ func (p *Plugin) gcloudADCLogin(ctx context.Context, _ sdkplugin.LoginRequest) (
 	// Compute effective scopes from token response for metadata storage
 	scopeStr := tokenResp.Scope
 	if scopeStr == "" {
-		scopeStr = "https://www.googleapis.com/auth/cloud-platform"
+		scopeStr = defaultGcloudADCScope
 	}
 
 	// Store metadata (but NOT the refresh token -- we leave that in gcloud's file)
@@ -279,4 +292,62 @@ func (p *Plugin) getGcloudADCToken(ctx context.Context, scope string, forceRefre
 	}
 
 	return token, nil
+}
+
+// validateGcloudADCCredentials checks whether gcloud ADC credentials can produce a valid token.
+// It reads from the token cache when available (no side effect), and probes the token endpoint
+// on a cache miss without persisting the result -- making it safe to call from GetStatus.
+func (p *Plugin) validateGcloudADCCredentials(ctx context.Context) error {
+	creds, err := LoadGcloudADCCredentials()
+	if err != nil {
+		if errors.Is(err, ErrNoGcloudADCConfigured) {
+			return ErrNotAuthenticated
+		}
+		return fmt.Errorf("loading gcloud ADC credentials: %w", err)
+	}
+
+	// Check cache first (read-only, no side effect).
+	// Uses defaultGcloudADCScope to match the cache key written by gcloudADCLogin when
+	// tokenResp.Scope is empty. Tokens cached under a server-returned scope (non-empty
+	// tokenResp.Scope) will miss here and fall through to the probe -- still correct.
+	hostClient := p.hostClient(ctx)
+	if hostClient != nil {
+		cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprintHash(creds.ClientID), defaultGcloudADCScope)
+		cached, cacheErr := cacheGet(ctx, hostClient, cacheKey)
+		if cacheErr == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
+			return nil
+		}
+	}
+
+	// No valid cached token -- probe the token endpoint without persisting the result.
+	data := url.Values{}
+	data.Set("grant_type", "refresh_token")
+	data.Set("client_id", creds.ClientID)
+	data.Set("client_secret", creds.ClientSecret)
+	data.Set("refresh_token", creds.RefreshToken)
+
+	resp, err := p.httpClient.PostForm(ctx, tokenEndpoint, data)
+	if err != nil {
+		return fmt.Errorf("gcloud ADC token refresh failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != 200 {
+		var errResp TokenErrorResponse
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&errResp); decodeErr != nil || errResp.Error == "" {
+			return fmt.Errorf("gcloud ADC token refresh failed: HTTP %d %s", resp.StatusCode, resp.Status)
+		}
+		return formatGcloudTokenError(errResp, p.binaryName())
+	}
+
+	// Decode and validate the response body -- a 200 with a missing access_token
+	// (e.g., unexpected HTML or partial JSON from a proxy) should not be treated as valid.
+	var tokenResp TokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return fmt.Errorf("gcloud ADC validation: unexpected token response: %w", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return fmt.Errorf("gcloud ADC validation: token endpoint returned 200 but access_token is empty")
+	}
+	return nil
 }
