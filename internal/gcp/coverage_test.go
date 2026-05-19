@@ -1684,15 +1684,15 @@ func TestGetStatus_GcloudADCFallback_TokenError(t *testing.T) {
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 	t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
 
-	// GetStatus no longer probes gcloud ADC tokens; it reports authenticated
-	// based on the presence of gcloud ADC credentials.
+	// No mock response configured → mock returns 500 → transient/unknown error → not authenticated.
 	status, err := p.GetStatus(context.Background(), HandlerName)
 	require.NoError(t, err)
-	assert.True(t, status.Authenticated)
+	assert.False(t, status.Authenticated)
+	assert.Contains(t, status.Reason, "failed to validate gcloud ADC credentials")
 }
 
 func TestGetStatus_GcloudADCFallback_InvalidGrant(t *testing.T) {
-	p, _, _ := newTestPlugin(t)
+	p, _, mockHTTP := newTestPlugin(t)
 
 	dir := t.TempDir()
 	adcFile := dir + "/application_default_credentials.json"
@@ -1708,11 +1708,16 @@ func TestGetStatus_GcloudADCFallback_InvalidGrant(t *testing.T) {
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 	t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
 
-	// GetStatus no longer probes gcloud ADC tokens; it reports authenticated
-	// based on the presence of gcloud ADC credentials.
+	// Simulate invalid_grant with RAPT error.
+	mockHTTP.AddResponse(400, TokenErrorResponse{
+		Error:            "invalid_grant",
+		ErrorDescription: "Token has been expired or revoked. invalid_rapt",
+	})
+
 	status, err := p.GetStatus(context.Background(), HandlerName)
 	require.NoError(t, err)
-	assert.True(t, status.Authenticated)
+	assert.False(t, status.Authenticated)
+	assert.Contains(t, status.Reason, "gcloud ADC credentials are invalid")
 }
 
 func TestGetStatus_GcloudADCFallback_Success(t *testing.T) {
@@ -1742,6 +1747,32 @@ func TestGetStatus_GcloudADCFallback_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, status.Authenticated)
 	assert.Equal(t, "gcloud ADC (application default credentials)", status.Claims.Name)
+}
+
+func TestGetStatus_GcloudADCFallback_EmptyAccessToken(t *testing.T) {
+	p, _, mockHTTP := newTestPlugin(t)
+
+	dir := t.TempDir()
+	adcFile := dir + "/application_default_credentials.json"
+	creds := GcloudADCCredentials{
+		ClientID:     "test-client-id",
+		ClientSecret: "test-client-secret",
+		RefreshToken: "test-refresh-token",
+		Type:         "authorized_user",
+	}
+	data, _ := json.Marshal(creds)
+	require.NoError(t, os.WriteFile(adcFile, data, 0o600))
+	t.Setenv("CLOUDSDK_CONFIG", dir)
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
+
+	// 200 response but access_token is missing (e.g., proxy HTML or partial JSON).
+	mockHTTP.AddResponse(200, TokenResponse{})
+
+	status, err := p.GetStatus(context.Background(), HandlerName)
+	require.NoError(t, err)
+	assert.False(t, status.Authenticated)
+	assert.Contains(t, status.Reason, "failed to validate gcloud ADC credentials")
 }
 
 func TestGetStatus_StoredRefreshToken_InvalidRAPT(t *testing.T) {
