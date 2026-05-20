@@ -462,8 +462,14 @@ func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) (
 
 	var flows []sdkplugin.FlowAvailability
 
-	// ADC: check for GOOGLE_APPLICATION_CREDENTIALS or default ADC file
-	if HasGcloudADCCredentials() {
+	// ADC: validate credentials are actually usable before advertising the flow.
+	// validateGcloudADCCredentials returns ErrNotAuthenticated when no ADC is
+	// configured (avoids the redundant file read that HasGcloudADCCredentials
+	// would cause) and also rejects stale/RAPT credentials.
+	// Use a short deadline so a slow token-endpoint probe does not stall flow detection.
+	adcCtx, adcCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer adcCancel()
+	if err := p.validateGcloudADCCredentials(adcCtx); err == nil {
 		flows = append(flows, sdkplugin.FlowAvailability{
 			Flow:      auth.FlowGcloudADC,
 			Available: true,

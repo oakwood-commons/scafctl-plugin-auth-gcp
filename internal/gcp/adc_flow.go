@@ -149,12 +149,13 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 		return nil, fmt.Errorf("failed to store credentials: %w", err)
 	}
 
-	// Cache the access token
+	// Cache the access token. Use empty scope in key because mintToken/refresh
+	// never passes scope to Google — the token always covers all authorized scopes.
 	if tokenResp.AccessToken != "" {
 		expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 		hostClient := p.hostClient(ctx)
 		if hostClient != nil {
-			cacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(clientID), scopeStr)
+			cacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(clientID), "")
 			_ = cacheSet(ctx, hostClient, cacheKey, &auth.Token{
 				AccessToken: tokenResp.AccessToken,
 				TokenType:   tokenResp.TokenType,
@@ -302,11 +303,12 @@ func (p *Plugin) getStoredRefreshToken(ctx context.Context, scope string, forceR
 
 	fingerprint := fingerprintHash(storedClientID)
 
-	// Check cache first
+	// Check cache first. Use empty scope in key because mintToken/refresh never
+	// passes scope to Google — the token always covers all authorized scopes.
 	if !forceRefresh {
 		hostClient := p.hostClient(ctx)
 		if hostClient != nil {
-			cacheKey := buildCacheKey(userFlow, fingerprint, scope)
+			cacheKey := buildCacheKey(userFlow, fingerprint, "")
 			cached, cacheErr := cacheGet(ctx, hostClient, cacheKey)
 			if cacheErr == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
 				lgr.V(1).Info("using cached token", "scope", scope)
@@ -324,7 +326,7 @@ func (p *Plugin) getStoredRefreshToken(ctx context.Context, scope string, forceR
 	// Cache the token
 	hostClient := p.hostClient(ctx)
 	if hostClient != nil {
-		cacheKey := buildCacheKey(userFlow, fingerprint, scope)
+		cacheKey := buildCacheKey(userFlow, fingerprint, "")
 		if cacheSetErr := cacheSet(ctx, hostClient, cacheKey, token); cacheSetErr != nil {
 			lgr.V(1).Info("failed to cache token", "error", cacheSetErr)
 		}

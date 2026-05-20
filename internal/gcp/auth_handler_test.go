@@ -3,6 +3,8 @@ package gcp
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -122,7 +124,7 @@ func TestGetStatus_NotAuthenticated(t *testing.T) {
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 	t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
 	t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
-	t.Setenv("GCE_METADATA_HOST", "192.0.2.1")
+	t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
 	status, err := p.GetStatus(context.Background(), HandlerName)
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
@@ -195,9 +197,9 @@ func TestGetToken_CachedToken(t *testing.T) {
 	fake.secrets[SecretKeyMetadata] = string(metaBytes)
 	fake.secrets[SecretKeyRefreshToken] = "test-refresh-token"
 
-	// Pre-populate cache
+	// Pre-populate cache (empty scope in key: refresh always returns full-scope token)
 	scope := "https://www.googleapis.com/auth/cloud-platform"
-	cacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(DefaultADCClientID), scope)
+	cacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(DefaultADCClientID), "")
 	entry := tokenCacheEntry{
 		AccessToken: "cached-access-token",
 		TokenType:   "Bearer",
@@ -300,7 +302,7 @@ func TestDetectAvailableFlows(t *testing.T) {
 		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 		t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
 		t.Setenv("CLOUDSDK_CONFIG", t.TempDir()) // point to empty dir
-		t.Setenv("GCE_METADATA_HOST", "192.0.2.1")
+		t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
 
 		p, _, _ := newTestPlugin(t)
 		flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
@@ -312,7 +314,7 @@ func TestDetectAvailableFlows(t *testing.T) {
 		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 		t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
 		t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
-		t.Setenv("GCE_METADATA_HOST", "192.0.2.1")
+		t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
 
 		p, _, _ := newTestPlugin(t)
 		p.config.ImpersonateServiceAccount = "sa@project.iam.gserviceaccount.com"
@@ -329,6 +331,42 @@ func TestDetectAvailableFlows(t *testing.T) {
 		p := &Plugin{}
 		_, err := p.DetectAvailableFlows(context.Background(), "unknown")
 		assert.Error(t, err)
+	})
+
+	t.Run("gcloud ADC exists but invalid skips flow", func(t *testing.T) {
+		p, _, mockHTTP := newTestPlugin(t)
+
+		// Create a temp ADC file with credentials that will fail validation.
+		adcDir := t.TempDir()
+		t.Setenv("CLOUDSDK_CONFIG", adcDir)
+		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+		t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
+		t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
+
+		adcCreds := GcloudADCCredentials{
+			ClientID:     "gcloud-client-id",
+			ClientSecret: "gcloud-client-secret",
+			RefreshToken: "gcloud-refresh-token",
+			Type:         "authorized_user",
+		}
+		adcBytes, err := json.Marshal(adcCreds)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(adcDir, "application_default_credentials.json"), adcBytes, 0o600))
+
+		// Token endpoint returns RAPT error → credentials are invalid.
+		mockHTTP.AddResponse(400, TokenErrorResponse{
+			Error:            "invalid_grant",
+			ErrorDescription: "reauth related error (invalid_rapt)",
+		})
+
+		flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
+		require.NoError(t, err)
+
+		// gcloud-adc should NOT appear since validation failed.
+		for _, f := range flows {
+			assert.NotEqual(t, auth.FlowGcloudADC, auth.Flow(f.Flow),
+				"gcloud-adc flow should not be reported when credentials are invalid")
+		}
 	})
 }
 
@@ -517,6 +555,16 @@ func TestBuildCacheKey(t *testing.T) {
 
 	assert.Equal(t, key1, key2, "same inputs should produce same key")
 	assert.NotEqual(t, key1, key3, "different inputs should produce different key")
+
+	// Scope ordering should not affect the key.
+	keyAB := buildCacheKey("flow1", "fp1", "scopeA scopeB")
+	keyBA := buildCacheKey("flow1", "fp1", "scopeB scopeA")
+	assert.Equal(t, keyAB, keyBA, "same scopes in different order should produce same key")
+
+	// Google short aliases should be canonicalized to long form.
+	keyShort := buildCacheKey("flow1", "fp1", "openid email profile")
+	keyLong := buildCacheKey("flow1", "fp1", "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile")
+	assert.Equal(t, keyShort, keyLong, "scope aliases should produce same key as canonical form")
 }
 
 func TestFingerprintHash(t *testing.T) {
@@ -567,7 +615,8 @@ func BenchmarkGetToken_Cached(b *testing.B) {
 	fake.secrets[SecretKeyRefreshToken] = "refresh"
 
 	scope := "https://www.googleapis.com/auth/cloud-platform"
-	cacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(DefaultADCClientID), scope)
+	// Use empty scope in key: refresh always returns a full-scope token (matches getStoredRefreshToken keying).
+	cacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(DefaultADCClientID), "")
 	entry := tokenCacheEntry{
 		AccessToken: "cached",
 		TokenType:   "Bearer",
