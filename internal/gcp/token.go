@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -380,8 +381,38 @@ func cachePurgeExpired(ctx context.Context, hostClient *sdkplugin.HostServiceCli
 }
 
 // buildCacheKey constructs a cache key from flow, fingerprint, and scope.
+// Scopes are normalized (canonicalized and sorted) so that equivalent scope sets
+// always produce the same cache key regardless of input ordering or alias form.
 func buildCacheKey(flow auth.Flow, fingerprint, scope string) string {
-	raw := string(flow) + ":" + fingerprint + ":" + scope
+	raw := string(flow) + ":" + fingerprint + ":" + normalizeScope(scope)
 	h := sha256.Sum256([]byte(raw))
 	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+// googleScopeAliases maps short OpenID Connect scope aliases to their canonical
+// long-form Google URLs. Google's token endpoint returns long forms regardless
+// of which form was requested.
+var googleScopeAliases = map[string]string{
+	"email":   "https://www.googleapis.com/auth/userinfo.email",
+	"profile": "https://www.googleapis.com/auth/userinfo.profile",
+}
+
+// normalizeScope canonicalizes, de-duplicates, and sorts a space-separated scope
+// string so that equivalent sets (differing only in order, alias form, or
+// repeated entries) always produce identical output.
+func normalizeScope(scope string) string {
+	parts := strings.Fields(scope)
+	seen := make(map[string]struct{}, len(parts))
+	uniq := parts[:0]
+	for _, s := range parts {
+		if canonical, ok := googleScopeAliases[s]; ok {
+			s = canonical
+		}
+		if _, dup := seen[s]; !dup {
+			seen[s] = struct{}{}
+			uniq = append(uniq, s)
+		}
+	}
+	slices.Sort(uniq)
+	return strings.Join(uniq, " ")
 }

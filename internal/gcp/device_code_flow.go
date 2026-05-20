@@ -101,12 +101,13 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 		return nil, fmt.Errorf("failed to store credentials: %w", err)
 	}
 
-	// Cache the access token
+	// Cache the access token. Use empty scope in key because mintToken/refresh
+	// never passes scope to Google — the token always covers all authorized scopes.
 	if tokenResp.AccessToken != "" {
 		expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 		hostClient := p.hostClient(ctx)
 		if hostClient != nil {
-			cacheKey := buildCacheKey(auth.FlowDeviceCode, fingerprintHash(clientID), scopeStr)
+			cacheKey := buildCacheKey(auth.FlowDeviceCode, fingerprintHash(clientID), "")
 			_ = cacheSet(ctx, hostClient, cacheKey, &auth.Token{
 				AccessToken: tokenResp.AccessToken,
 				TokenType:   tokenResp.TokenType,

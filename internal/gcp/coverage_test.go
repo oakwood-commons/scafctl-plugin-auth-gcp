@@ -288,7 +288,7 @@ func TestGetStatus_WithSACredentials(t *testing.T) {
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 	t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
 	t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
-	t.Setenv("GCE_METADATA_HOST", "192.0.2.1")
+	t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
 
 	status, err := p.GetStatus(context.Background(), HandlerName)
 	require.NoError(t, err)
@@ -441,7 +441,7 @@ func TestGetStoredRefreshToken_Cached(t *testing.T) {
 	fake.secrets[SecretKeyMetadata] = string(metaBytes)
 
 	scope := "openid"
-	cacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(DefaultADCClientID), scope)
+	cacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(DefaultADCClientID), "")
 	entry := tokenCacheEntry{
 		AccessToken: "cached-at",
 		TokenType:   "Bearer",
