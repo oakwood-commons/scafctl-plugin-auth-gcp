@@ -10,7 +10,7 @@ require (
 	github.com/oakwood-commons/oauth-helpers v0.2.0
 	github.com/oakwood-commons/scafctl-plugin-sdk v0.5.1
 	github.com/stretchr/testify v1.11.1
-	google.golang.org/grpc v1.81.0
+	google.golang.org/grpc v1.81.1
 )
 
 require (
