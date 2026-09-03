@@ -108,13 +108,13 @@ func TestLogin_UnknownHandler(t *testing.T) {
 func TestLogout(t *testing.T) {
 	t.Run("known handler", func(t *testing.T) {
 		p, _, _ := newTestPlugin(t)
-		err := p.Logout(context.Background(), HandlerName)
+		err := p.Logout(context.Background(), HandlerName, sdkplugin.LogoutRequest{})
 		require.NoError(t, err)
 	})
 
 	t.Run("unknown handler", func(t *testing.T) {
 		p := &Plugin{}
-		err := p.Logout(context.Background(), "unknown")
+		err := p.Logout(context.Background(), "unknown", sdkplugin.LogoutRequest{})
 		assert.Error(t, err)
 	})
 }
@@ -125,7 +125,7 @@ func TestGetStatus_NotAuthenticated(t *testing.T) {
 	t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
 	t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
 	t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
 }
@@ -146,7 +146,7 @@ func TestGetStatus_WithMetadata(t *testing.T) {
 	metaBytes, _ := json.Marshal(metadata)
 	fake.secrets[SecretKeyMetadata] = string(metaBytes)
 
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.True(t, status.Authenticated)
 	assert.Equal(t, "user@example.com", status.Claims.Email)
@@ -155,7 +155,7 @@ func TestGetStatus_WithMetadata(t *testing.T) {
 
 func TestGetStatus_UnknownHandler(t *testing.T) {
 	p := &Plugin{}
-	_, err := p.GetStatus(context.Background(), "unknown")
+	_, err := p.GetStatus(context.Background(), "unknown", sdkplugin.StatusRequest{})
 	assert.Error(t, err)
 }
 
@@ -585,7 +585,7 @@ func TestLogoutClearsSecrets(t *testing.T) {
 	fake.secrets[SecretKeyMetadata] = `{"flow": "interactive"}`
 	fake.secrets[SecretKeyTokenPrefix+"key1"] = `{"accessToken": "at"}`
 
-	err := p.Logout(context.Background(), HandlerName)
+	err := p.Logout(context.Background(), HandlerName, sdkplugin.LogoutRequest{})
 	require.NoError(t, err)
 
 	assert.Empty(t, fake.secrets, "all secrets should be cleared after logout")
@@ -656,7 +656,7 @@ func BenchmarkGetStatus_NoNetwork(b *testing.B) {
 
 	b.ResetTimer()
 	for range b.N {
-		_, err := p.GetStatus(ctx, HandlerName)
+		_, err := p.GetStatus(ctx, HandlerName, sdkplugin.StatusRequest{})
 		if err != nil {
 			b.Fatal(err)
 		}

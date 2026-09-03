@@ -290,7 +290,7 @@ func TestGetStatus_WithSACredentials(t *testing.T) {
 	t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
 	t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
 
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
 }
@@ -310,7 +310,7 @@ func TestGetStatus_WithMetadataFlow(t *testing.T) {
 	metaBytes, _ := json.Marshal(metadata)
 	fake.secrets[SecretKeyMetadata] = string(metaBytes)
 
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.True(t, status.Authenticated)
 }
@@ -1685,7 +1685,7 @@ func TestGetStatus_GcloudADCFallback_TokenError(t *testing.T) {
 	t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
 
 	// No mock response configured → mock returns 500 → transient/unknown error → not authenticated.
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
 	assert.Contains(t, status.Reason, "failed to validate gcloud ADC credentials")
@@ -1714,7 +1714,7 @@ func TestGetStatus_GcloudADCFallback_InvalidGrant(t *testing.T) {
 		ErrorDescription: "Token has been expired or revoked. invalid_rapt",
 	})
 
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
 	assert.Contains(t, status.Reason, "gcloud ADC credentials are invalid")
@@ -1743,7 +1743,7 @@ func TestGetStatus_GcloudADCFallback_Success(t *testing.T) {
 		ExpiresIn:   3600,
 	})
 
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.True(t, status.Authenticated)
 	assert.Equal(t, "gcloud ADC (application default credentials)", status.Claims.Name)
@@ -1769,7 +1769,7 @@ func TestGetStatus_GcloudADCFallback_EmptyAccessToken(t *testing.T) {
 	// 200 response but access_token is missing (e.g., proxy HTML or partial JSON).
 	mockHTTP.AddResponse(200, TokenResponse{})
 
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
 	assert.Contains(t, status.Reason, "failed to validate gcloud ADC credentials")
@@ -1797,7 +1797,7 @@ func TestGetStatus_StoredRefreshToken_InvalidRAPT(t *testing.T) {
 		ErrorDescription: "invalid_rapt token",
 	})
 
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
 	assert.Equal(t, "expired (RAPT policy)", status.Reason)
@@ -1825,7 +1825,7 @@ func TestGetStatus_StoredRefreshToken_GenericFailure(t *testing.T) {
 		ErrorDescription: "internal error",
 	})
 
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
 	assert.Equal(t, "token refresh failed", status.Reason)
@@ -1921,7 +1921,7 @@ func TestGetStatus_CorruptedMetadata(t *testing.T) {
 
 	fake.secrets[SecretKeyMetadata] = "not-valid-json{{"
 
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.False(t, status.Authenticated)
 }
@@ -1945,7 +1945,7 @@ func TestGetStatus_ServicePrincipalFlow(t *testing.T) {
 	metaBytes, _ := json.Marshal(metadata)
 	fake.secrets[SecretKeyMetadata] = string(metaBytes)
 
-	status, err := p.GetStatus(context.Background(), HandlerName)
+	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.True(t, status.Authenticated)
 	assert.Equal(t, auth.IdentityTypeServicePrincipal, status.IdentityType)
