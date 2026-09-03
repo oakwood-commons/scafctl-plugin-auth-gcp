@@ -1,6 +1,6 @@
 module github.com/oakwood-commons/scafctl-plugin-auth-gcp
 
-go 1.26.6
+go 1.27.1
 
 require (
 	github.com/go-logr/logr v1.4.4
