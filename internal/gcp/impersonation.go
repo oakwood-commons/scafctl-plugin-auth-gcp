@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -44,6 +45,15 @@ func (p *Plugin) impersonateServiceAccount(ctx context.Context, sourceToken, tar
 		"scopes", scopes,
 	)
 
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	endpoint := fmt.Sprintf("%s/projects/-/serviceAccounts/%s:generateAccessToken",
 		iamCredentialsEndpoint, url.PathEscape(targetSA))
 
@@ -64,7 +74,7 @@ func (p *Plugin) impersonateServiceAccount(ctx context.Context, sourceToken, tar
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+sourceToken)
 
-	resp, err := p.httpClient.Do(ctx, req)
+	resp, err := httpClient.Do(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("impersonation request failed: %w", err)
 	}
@@ -76,15 +86,15 @@ func (p *Plugin) impersonateServiceAccount(ctx context.Context, sourceToken, tar
 
 	if resp.StatusCode != http.StatusOK {
 		var errBody map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&errBody)
+		_ = json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&errBody)
 		msg := ""
 		if errObj, ok := errBody["error"].(map[string]any); ok {
 			if s, ok := errObj["message"].(string); ok {
-				msg = s
+				msg = sanitizeControlChars(s)
 			}
 		}
 		if msg == "" {
-			msg = fmt.Sprintf("%v", errBody)
+			msg = sanitizeControlChars(fmt.Sprintf("%v", errBody))
 		}
 		if resp.StatusCode == http.StatusUnauthorized {
 			return nil, fmt.Errorf(
@@ -96,8 +106,11 @@ func (p *Plugin) impersonateServiceAccount(ctx context.Context, sourceToken, tar
 	}
 
 	var impResp ImpersonationResponse
-	if err := json.NewDecoder(resp.Body).Decode(&impResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&impResp); err != nil {
 		return nil, fmt.Errorf("parsing impersonation response: %w", err)
+	}
+	if impResp.AccessToken == "" {
+		return nil, fmt.Errorf("impersonation failed: endpoint returned empty accessToken")
 	}
 
 	// Parse the expiry time
@@ -116,37 +129,78 @@ func (p *Plugin) impersonateServiceAccount(ctx context.Context, sourceToken, tar
 		TokenType:   "Bearer",
 		ExpiresAt:   expireTime,
 		Scope:       strings.Join(scopes, " "),
-		Flow:        auth.Flow("impersonation"),
+		Flow:        auth.FlowInteractive,
 	}, nil
 }
 
 // getImpersonatedToken acquires a token for the impersonated service account.
 func (p *Plugin) getImpersonatedToken(ctx context.Context, sourceAccessToken, scope string, forceRefresh bool) (*auth.Token, error) {
+	return p.getImpersonatedTokenWithSource(ctx, &auth.Token{AccessToken: sourceAccessToken}, scope, forceRefresh, DefaultMinValidFor)
+}
+
+func (p *Plugin) getImpersonatedTokenWithSource(ctx context.Context, sourceToken *auth.Token, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
-	targetSA := p.config.ImpersonateServiceAccount
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if minValidFor <= 0 {
+		minValidFor = DefaultMinValidFor
+	}
+
+	targetSA := cfg.ImpersonateServiceAccount
 
 	// Determine scopes
 	scopes := []string{scope}
 	if scope == "" {
-		scopes = p.config.DefaultScopes
+		scopes = cfg.DefaultScopes
 	}
 
-	// Check cache for impersonated token
+	var sessionID string
+	var effectiveFlow auth.Flow
+	if sourceToken != nil {
+		sessionID = sourceToken.SessionID
+		effectiveFlow = sourceToken.Flow
+	}
+	if metadata, metaErr := p.loadMetadata(ctx); metaErr == nil && metadata != nil {
+		if sessionID == "" {
+			sessionID = metadata.SessionID
+		}
+		if effectiveFlow == "" {
+			effectiveFlow = metadata.Flow
+		}
+	}
+	if effectiveFlow == "" {
+		effectiveFlow = auth.FlowInteractive
+	}
+
+	// Check cache for impersonated token in ctx's profile
 	impersonateFingerprint := fingerprintHash(targetSA)
+	prefix := p.tokenCachePrefix(ctx)
+	cacheKey := buildCacheKey("impersonation", impersonateFingerprint, scope)
 	if !forceRefresh {
-		hostClient := p.hostClient(ctx)
-		if hostClient != nil {
-			cacheKey := buildCacheKey("impersonation", impersonateFingerprint, scope)
-			cached, cacheErr := cacheGet(ctx, hostClient, cacheKey)
-			if cacheErr == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
-				lgr.V(1).Info("using cached impersonated token",
-					"targetServiceAccount", targetSA,
-					"scope", scope,
-				)
-				return cached, nil
+		if hostClient := p.hostClient(ctx); hostClient != nil {
+			cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
+			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) {
+				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
+					if cached.Flow == "" || cached.Flow == auth.Flow("impersonation") {
+						cached.Flow = effectiveFlow
+					}
+					lgr.V(1).Info("using cached impersonated token",
+						"targetServiceAccount", targetSA,
+						"scope", scope,
+					)
+					return cached, nil
+				}
 			}
 		}
+	}
+
+	var sourceAccessToken string
+	if sourceToken != nil {
+		sourceAccessToken = sourceToken.AccessToken
 	}
 
 	// Impersonate
@@ -155,19 +209,13 @@ func (p *Plugin) getImpersonatedToken(ctx context.Context, sourceAccessToken, sc
 		return nil, err
 	}
 
-	// Propagate SessionID from stored metadata so cache entries group correctly.
-	if metadata, metaErr := p.loadMetadata(ctx); metaErr == nil && metadata != nil {
-		token.SessionID = metadata.SessionID
+	token.Flow = effectiveFlow
+	if sessionID != "" {
+		token.SessionID = sessionID
 	}
 
-	// Cache the impersonated token
-	hostClient := p.hostClient(ctx)
-	if hostClient != nil {
-		cacheKey := buildCacheKey("impersonation", impersonateFingerprint, scope)
-		if cacheSetErr := cacheSet(ctx, hostClient, cacheKey, token); cacheSetErr != nil {
-			lgr.V(1).Info("failed to cache impersonated token", "error", cacheSetErr)
-		}
-	}
+	// Cache the impersonated token if the session is still current
+	p.cacheTokenForSession(ctx, cacheKey, token)
 
 	return token, nil
 }

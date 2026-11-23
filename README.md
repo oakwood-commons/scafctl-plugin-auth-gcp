@@ -6,30 +6,62 @@ Google Cloud Platform authentication handler plugin for scafctl.
 
 | Flow | Description | Use Case |
 |------|-------------|----------|
+| `interactive` | Application Default Credentials (browser OAuth with PKCE) | Local developer workstations |
 | `device_code` | OAuth 2.0 device authorization grant | Headless/CI environments |
-| `adc` | Application Default Credentials (browser OAuth with PKCE) | Local developer workstations |
 | `metadata` | GCE metadata server | Workloads running on GCE/GKE/Cloud Run |
-| `service_account` | Service account key JWT assertion | CI/CD with service account JSON keys |
+| `service_principal` | Service account key JWT assertion | CI/CD with service account JSON keys |
 | `workload_identity` | Workload Identity Federation (STS token exchange) | Cross-cloud or OIDC-federated workloads |
-| `impersonation` | IAM Credentials API impersonation | Accessing resources as another service account |
 | `gcloud_adc` | Reads gcloud's cached ADC credentials | Fallback when gcloud is already authenticated |
+
+Service account impersonation (`impersonateServiceAccount`) can be combined with any credential source above to mint short-lived tokens via the IAM Credentials API.
 
 ## Configuration
 
-The plugin reads configuration from a JSON file at
-`$XDG_CONFIG_HOME/scafctl/auth-handlers/gcp.json`:
+Configure `auth.gcp` in your scafctl `config.yaml`:
 
-```json
-{
-  "client_id": "YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com",
-  "client_secret": "YOUR_OAUTH_CLIENT_SECRET",
-  "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
-  "project_id": "my-gcp-project"
-}
+```yaml
+auth:
+  gcp:
+    clientId: "YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com"
+    clientSecret: "YOUR_OAUTH_CLIENT_SECRET"
+    defaultScopes:
+      - openid
+      - email
+      - profile
+      - https://www.googleapis.com/auth/cloud-platform
+    project: my-gcp-project
+    impersonateServiceAccount: deploy@my-gcp-project.iam.gserviceaccount.com
+    activeProfile: work
+    profiles:
+      work:
+        project: work-gcp-project
+        serviceAccountKeyFile: /path/to/work-sa.json
+      personal:
+        project: personal-gcp-project
 ```
 
-All fields are optional. The plugin ships with sensible defaults for public
-OAuth clients (similar to gcloud's own client ID).
+Keys under `auth.gcp` (and `auth.gcp.profiles.<name>`):
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `clientId` | Google public ADC client ID | OAuth 2.0 client ID for interactive and device-code flows |
+| `clientSecret` | Google public ADC client secret | OAuth 2.0 client secret |
+| `defaultScopes` | `openid`, `email`, `profile`, `https://www.googleapis.com/auth/cloud-platform` | Default OAuth scopes requested during login |
+| `impersonateServiceAccount` | *(empty)* | Service account email to impersonate on token requests |
+| `project` | *(empty)* | Default GCP project ID recorded in session metadata |
+| `serviceAccountKeyFile` | *(empty)* | Path to service account JSON key; takes precedence over `GOOGLE_APPLICATION_CREDENTIALS` |
+| `externalAccountFile` | *(empty)* | Path to Workload Identity Federation JSON config; takes precedence over `GOOGLE_EXTERNAL_ACCOUNT` |
+| `httpClient` | 30s timeout, 3 retries, cache off | Optional HTTP client overrides (`timeout`, `retryMax`, `enableCircuitBreaker`, etc.) |
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `GOOGLE_EXTERNAL_ACCOUNT` | Path to Workload Identity Federation external account JSON file |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to service account key JSON file (or `authorized_user` gcloud ADC JSON file) |
+| `CLOUDSDK_CONFIG` | Custom gcloud configuration directory for `gcloud_adc` discovery |
+| `GCE_METADATA_HOST` | Loopback/metadata override for the GCE metadata server |
+| `BROWSER` | Preferred browser executable or fallback list for interactive login when `--browser` is not passed |
 
 ## Security Note
 
@@ -71,8 +103,26 @@ Register this plugin in your scafctl configuration, then use
 the **gcp** auth handler:
 
 ```bash
+# Interactive browser login (default)
 scafctl auth login gcp
+
+# Login to a named profile
+scafctl auth login gcp --profile work
+
+# Open a specific browser for interactive login
+scafctl auth login gcp --flow interactive --browser chrome
+
+# Pin the localhost OAuth callback port (e.g. for SSH port forwarding)
+scafctl auth login gcp --flow interactive --callback-port 8400
 ```
+
+### Interactive OAuth Callback Pages
+
+During `interactive` browser login, the localhost callback server uses deferred completion (`oauth.WithDeferredCompletion`) and renders host-supplied Blueprint HTML pages (`ProviderConfig.AuthCallbackPages` passed via `ConfigureAuthHandler`) when configured, falling back to `oauth-helpers` built-in dark-mode cards with strict `Content-Security-Policy` headers otherwise:
+
+- **HTTP `200 OK`** (`SuccessHTML`): rendered only after authorization code exchange, ID token/claims verification, and credential persistence all succeed.
+- **HTTP `503 Service Unavailable`** (`FailureHTML`): rendered when post-callback token exchange, claims validation, context cancellation, or credential storage fails, without clobbering any previously authenticated session.
+- **HTTP `400 Bad Request` / `403 Forbidden`** (`FailureHTML`): rendered on direct OAuth authorization errors or mismatched OAuth `state` parameters.
 
 Once authenticated, reference it in HTTP requests:
 
@@ -93,6 +143,9 @@ resolvers:
 # Run tests
 task test
 
+# Run tests with race detector
+task test:race
+
 # Run linter
 task lint
 
@@ -102,8 +155,6 @@ task build
 # Full CI pipeline (lint + test + build)
 task ci
 ```
-
-
 
 ## Release
 

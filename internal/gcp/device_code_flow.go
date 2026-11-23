@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -41,9 +43,20 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting GCP device code authentication flow", "handler", HandlerName)
 
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	// Use configured client ID, or fall back to Google's well-known ADC client credentials
-	clientID := p.config.ClientID
-	clientSecret := p.config.ClientSecret
+	clientID := cfg.ClientID
+	clientSecret := cfg.ClientSecret
 	if clientID == "" {
 		lgr.V(1).Info("no client ID configured, using Google's default ADC client credentials")
 		clientID = DefaultADCClientID
@@ -53,7 +66,7 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 	// Determine scopes
 	scopes := req.Scopes
 	if len(scopes) == 0 {
-		scopes = p.config.DefaultScopes
+		scopes = cfg.DefaultScopes
 	}
 
 	// Determine timeout
@@ -75,16 +88,19 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 		return nil, fmt.Errorf("device code request failed: %w", err)
 	}
 
+	safeUserCode := sanitizeControlChars(deviceCode.UserCode)
+	safeVerificationURL := sanitizeControlChars(deviceCode.VerificationURL)
+
 	lgr.V(1).Info("device code obtained",
-		"userCode", deviceCode.UserCode,
-		"verificationURL", deviceCode.VerificationURL,
+		"userCode", safeUserCode,
+		"verificationURL", safeVerificationURL,
 	)
 
 	// Step 2: Notify callback with device code info for CLI display
 	if deviceCodeCb != nil {
 		deviceCodeCb(sdkplugin.DeviceCodePrompt{
-			UserCode:        deviceCode.UserCode,
-			VerificationURI: deviceCode.VerificationURL,
+			UserCode:        safeUserCode,
+			VerificationURI: safeVerificationURL,
 			Message:         "Enter this code to authenticate with Google Cloud",
 		})
 	}
@@ -95,43 +111,48 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 		return nil, fmt.Errorf("device code polling failed: %w", err)
 	}
 
-	// Step 4: Store credentials
-	scopeStr := strings.Join(scopes, " ")
-	if err := p.storeCredentials(ctx, tokenResp, auth.FlowDeviceCode, scopes, "", clientID); err != nil {
-		return nil, fmt.Errorf("failed to store credentials: %w", err)
-	}
-
-	// Cache the access token. Use empty scope in key because mintToken/refresh
-	// never passes scope to Google — the token always covers all authorized scopes.
-	if tokenResp.AccessToken != "" {
-		expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-		hostClient := p.hostClient(ctx)
-		if hostClient != nil {
-			cacheKey := buildCacheKey(auth.FlowDeviceCode, fingerprintHash(clientID), "")
-			_ = cacheSet(ctx, hostClient, cacheKey, &auth.Token{
-				AccessToken: tokenResp.AccessToken,
-				TokenType:   tokenResp.TokenType,
-				ExpiresAt:   expiresAt,
-				Scope:       scopeStr,
-				Flow:        auth.FlowDeviceCode,
-			})
+	// Step 4: Validate and extract claims before mutating stored credentials
+	var claims *auth.Claims
+	if tokenResp.IDToken != "" {
+		claims, err = extractClaimsFromIDToken(tokenResp.IDToken)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract claims from ID token: %w", err)
 		}
-	}
-
-	// Extract claims
-	claims, err := extractClaims(tokenResp)
-	if err != nil {
-		if tokenResp.AccessToken != "" {
-			claims, err = p.fetchUserinfoClaims(ctx, tokenResp.AccessToken)
-			if err != nil {
-				claims = &auth.Claims{Issuer: "https://accounts.google.com"}
+	} else if tokenResp.AccessToken != "" {
+		claims, err = p.fetchUserinfoClaimsWithClient(ctx, httpClient, tokenResp.AccessToken)
+		if err != nil {
+			if ctx.Err() != nil {
+				if ctx.Err() == context.DeadlineExceeded {
+					return nil, fmt.Errorf("authentication timed out: %w", ErrTimeout)
+				}
+				return nil, fmt.Errorf("authentication cancelled: %w", ErrUserCancelled)
 			}
-		} else {
 			claims = &auth.Claims{Issuer: "https://accounts.google.com"}
 		}
+	} else {
+		claims = &auth.Claims{Issuer: "https://accounts.google.com"}
 	}
 
+	// Step 5: Atomically commit credentials and seed cached access token
+	scopeStr := strings.Join(scopes, " ")
 	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	var initialCacheKey string
+	var initialToken *auth.Token
+	if tokenResp.AccessToken != "" {
+		initialCacheKey = buildCacheKey(auth.FlowDeviceCode, fingerprintHash(clientID), "")
+		initialToken = &auth.Token{
+			AccessToken: tokenResp.AccessToken,
+			TokenType:   tokenResp.TokenType,
+			ExpiresAt:   expiresAt,
+			Scope:       scopeStr,
+			Flow:        auth.FlowDeviceCode,
+		}
+	}
+
+	_, err = p.storeCredentialsAndSeedToken(ctx, cfg, tokenResp, auth.FlowDeviceCode, scopes, "", clientID, claims, initialCacheKey, initialToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store credentials: %w", err)
+	}
 
 	lgr.V(1).Info("GCP device code flow completed successfully",
 		"email", claims.Email,
@@ -146,25 +167,34 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 
 // requestGCPDeviceCode requests a device code from Google's device authorization endpoint.
 func (p *Plugin) requestGCPDeviceCode(ctx context.Context, clientID string, scopes []string) (*DeviceCodeResponse, error) {
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	data := url.Values{}
 	data.Set("client_id", clientID)
 	data.Set("scope", strings.Join(scopes, " "))
 
-	resp, err := p.httpClient.PostForm(ctx, deviceCodeEndpoint, data)
+	resp, err := httpClient.PostForm(ctx, deviceCodeEndpoint, data)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		var errResp TokenErrorResponse
-		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		_ = json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&errResp)
 		return nil, fmt.Errorf("device code request failed (%d): %s - %s",
-			resp.StatusCode, errResp.Error, errResp.ErrorDescription)
+			resp.StatusCode, sanitizeControlChars(errResp.Error), sanitizeControlChars(errResp.ErrorDescription))
 	}
 
 	var deviceCode DeviceCodeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&deviceCode); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&deviceCode); err != nil {
 		return nil, fmt.Errorf("failed to parse device code response: %w", err)
 	}
 
@@ -176,12 +206,21 @@ func (p *Plugin) requestGCPDeviceCode(ctx context.Context, clientID string, scop
 func (p *Plugin) pollGCPDeviceToken(ctx context.Context, deviceCode *DeviceCodeResponse, clientID, clientSecret string) (*TokenResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	interval := time.Duration(deviceCode.Interval) * time.Second
 	if interval < defaultDeviceCodePollInterval {
 		interval = defaultDeviceCodePollInterval
 	}
 
-	ticker := p.clock.NewTicker(interval)
+	ticker := p.getClock().NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -200,7 +239,7 @@ func (p *Plugin) pollGCPDeviceToken(ctx context.Context, deviceCode *DeviceCodeR
 			data.Set("device_code", deviceCode.DeviceCode)
 			data.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 
-			resp, err := p.httpClient.PostForm(ctx, tokenEndpoint, data)
+			resp, err := httpClient.PostForm(ctx, tokenEndpoint, data)
 			if err != nil {
 				lgr.V(1).Info("transient network error during device code poll, continuing", "error", err)
 				continue
@@ -210,7 +249,7 @@ func (p *Plugin) pollGCPDeviceToken(ctx context.Context, deviceCode *DeviceCodeR
 				TokenResponse
 				TokenErrorResponse
 			}
-			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&body); err != nil {
 				_ = resp.Body.Close()
 				return nil, fmt.Errorf("failed to parse token response: %w", err)
 			}
@@ -242,7 +281,8 @@ func (p *Plugin) pollGCPDeviceToken(ctx context.Context, deviceCode *DeviceCodeR
 			case "access_denied":
 				return nil, fmt.Errorf("user denied access: %w", ErrUserCancelled)
 			default:
-				return nil, fmt.Errorf("token request failed: %s - %s", body.Error, body.ErrorDescription)
+				return nil, fmt.Errorf("token request failed: %s - %s",
+					sanitizeControlChars(body.Error), sanitizeControlChars(body.ErrorDescription))
 			}
 		}
 	}

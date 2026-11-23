@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -44,15 +46,12 @@ type ServiceAccountKey struct {
 	ClientX509CertURL       string `json:"client_x509_cert_url"`
 }
 
-// GetServiceAccountKey reads and parses a service account key from the
-// GOOGLE_APPLICATION_CREDENTIALS environment variable.
-func GetServiceAccountKey() (*ServiceAccountKey, error) {
-	path := os.Getenv(EnvGoogleApplicationCredentials)
+func getServiceAccountKeyFromPath(path string, explicit bool) (*ServiceAccountKey, error) {
 	if path == "" {
 		return nil, ErrNoServiceAccountConfigured
 	}
 
-	data, err := os.ReadFile(path) //nolint:gosec // G703: path from env var is expected
+	data, err := os.ReadFile(path) //nolint:gosec // G304/G703: path from operator config or GOOGLE_APPLICATION_CREDENTIALS
 	if err != nil {
 		return nil, fmt.Errorf("reading service account key file: %w", err)
 	}
@@ -63,15 +62,40 @@ func GetServiceAccountKey() (*ServiceAccountKey, error) {
 	}
 
 	if key.Type != "service_account" {
+		if explicit {
+			return nil, fmt.Errorf("serviceAccountKeyFile has unsupported credential type %q (expected \"service_account\")", sanitizeControlChars(key.Type))
+		}
 		return nil, ErrNoServiceAccountConfigured
 	}
 
 	return &key, nil
 }
 
-// HasServiceAccountCredentials checks if service account credentials are configured.
+// GetServiceAccountKey reads and parses a service account key from the
+// GOOGLE_APPLICATION_CREDENTIALS environment variable.
+func GetServiceAccountKey() (*ServiceAccountKey, error) {
+	return getServiceAccountKeyFromPath(os.Getenv(EnvGoogleApplicationCredentials), false)
+}
+
+// HasServiceAccountCredentials checks if service account credentials are configured in the environment.
 func HasServiceAccountCredentials() bool {
 	_, err := GetServiceAccountKey()
+	return err == nil
+}
+
+func (p *Plugin) getServiceAccountKeyForConfig(cfg *Config) (*ServiceAccountKey, error) {
+	if cfg == nil {
+		cfg = p.baseConfig()
+	}
+	explicitPath := cfg.profileOrEnv(cfg.ServiceAccountKeyFile, "serviceAccountKeyFile", "")
+	if explicitPath != "" {
+		return getServiceAccountKeyFromPath(explicitPath, true)
+	}
+	return getServiceAccountKeyFromPath(os.Getenv(EnvGoogleApplicationCredentials), false)
+}
+
+func (p *Plugin) hasServiceAccountCredentialsForConfig(cfg *Config) bool {
+	_, err := p.getServiceAccountKeyForConfig(cfg)
 	return err == nil
 }
 
@@ -80,10 +104,16 @@ func (p *Plugin) serviceAccountLogin(ctx context.Context, req sdkplugin.LoginReq
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting service account key login", "handler", HandlerName)
 
-	key, err := GetServiceAccountKey()
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
+	key, err := p.getServiceAccountKeyForConfig(cfg)
 	if err != nil {
 		if errors.Is(err, ErrNoServiceAccountConfigured) {
-			return nil, fmt.Errorf("service account credentials not configured: set %s environment variable",
+			return nil, fmt.Errorf("service account credentials not configured: set serviceAccountKeyFile in config or %s environment variable",
 				EnvGoogleApplicationCredentials)
 		}
 		return nil, fmt.Errorf("service account credentials error: %w", err)
@@ -111,8 +141,8 @@ func (p *Plugin) serviceAccountLogin(ctx context.Context, req sdkplugin.LoginReq
 		ObjectID: key.ClientID,
 	}
 
-	// Store metadata
-	if err := p.storeMetadataOnly(ctx, claims, auth.FlowServicePrincipal, scopes); err != nil {
+	cacheKey := buildCacheKey(auth.FlowServicePrincipal, fingerprintHash(key.ClientEmail), scope)
+	if _, err := p.storeMetadataAndSeedToken(ctx, claims, auth.FlowServicePrincipal, scopes, cacheKey, token); err != nil {
 		lgr.V(1).Info("warning: failed to store metadata", "error", err)
 	}
 
@@ -131,13 +161,27 @@ func (p *Plugin) serviceAccountLogin(ctx context.Context, req sdkplugin.LoginReq
 func (p *Plugin) acquireServiceAccountToken(ctx context.Context, key *ServiceAccountKey, scope string) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	sourceLabel := EnvGoogleApplicationCredentials
+	if cfg.profileOrEnv(cfg.ServiceAccountKeyFile, "serviceAccountKeyFile", "") != "" {
+		sourceLabel = "serviceAccountKeyFile"
+	}
+
 	// Parse the private key using golang-jwt's built-in PEM parser.
 	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(key.PrivateKey))
 	if err != nil {
 		return nil, fmt.Errorf(
 			"failed to parse service account private key: "+
 				"the private_key field in %s may be malformed or not in PEM format: %w",
-			EnvGoogleApplicationCredentials, err)
+			sourceLabel, err)
 	}
 
 	// Use key.TokenURI when present, falling back to the default tokenEndpoint.
@@ -175,25 +219,28 @@ func (p *Plugin) acquireServiceAccountToken(ctx context.Context, key *ServiceAcc
 		"scope", scope,
 	)
 
-	resp, err := p.httpClient.PostForm(ctx, audience, data)
+	resp, err := httpClient.PostForm(ctx, audience, data)
 	if err != nil {
 		return nil, fmt.Errorf("token request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		var errResp TokenErrorResponse
-		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		_ = json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&errResp)
 		return nil, fmt.Errorf(
 			"service account token request failed: %s - %s. "+
 				"Verify the key in %s is valid, has not been revoked, "+
 				"and the service account has the required IAM roles for the requested scope",
-			errResp.Error, errResp.ErrorDescription, EnvGoogleApplicationCredentials)
+			sanitizeControlChars(errResp.Error), sanitizeControlChars(errResp.ErrorDescription), sourceLabel)
 	}
 
 	var tokenResp TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("service account token request failed: token endpoint returned empty access_token")
 	}
 
 	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
@@ -214,24 +261,44 @@ func (p *Plugin) acquireServiceAccountToken(ctx context.Context, key *ServiceAcc
 
 // getServiceAccountToken gets a token using service account key, with caching.
 func (p *Plugin) getServiceAccountToken(ctx context.Context, scope string, forceRefresh bool) (*auth.Token, error) {
+	return p.getServiceAccountTokenWithMinValidFor(ctx, scope, forceRefresh, DefaultMinValidFor)
+}
+
+func (p *Plugin) getServiceAccountTokenWithMinValidFor(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
-	key, err := GetServiceAccountKey()
+	if minValidFor <= 0 {
+		minValidFor = DefaultMinValidFor
+	}
+
+	cfg, err := p.effectiveConfig(ctx)
 	if err != nil {
-		return nil, ErrNotAuthenticated
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
+	key, err := p.getServiceAccountKeyForConfig(cfg)
+	if err != nil {
+		if errors.Is(err, ErrNoServiceAccountConfigured) {
+			return nil, ErrNotAuthenticated
+		}
+		return nil, fmt.Errorf("service account credentials error: %w", err)
 	}
 
 	fingerprint := fingerprintHash(key.ClientEmail)
+	prefix := p.tokenCachePrefix(ctx)
+	sessionID := p.readFlowSessionID(ctx, auth.FlowServicePrincipal)
+	cacheKey := buildCacheKey(auth.FlowServicePrincipal, fingerprint, scope)
 
 	// Check cache first
 	if !forceRefresh {
-		hostClient := p.hostClient(ctx)
-		if hostClient != nil {
-			cacheKey := buildCacheKey(auth.FlowServicePrincipal, fingerprint, scope)
-			cached, cacheErr := cacheGet(ctx, hostClient, cacheKey)
-			if cacheErr == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
-				lgr.V(1).Info("using cached SA token", "scope", scope)
-				return cached, nil
+		if hostClient := p.hostClient(ctx); hostClient != nil {
+			cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
+			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) {
+				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
+					lgr.V(1).Info("using cached SA token", "scope", scope)
+					return cached, nil
+				}
 			}
 		}
 	}
@@ -241,30 +308,48 @@ func (p *Plugin) getServiceAccountToken(ctx context.Context, scope string, force
 	if err != nil {
 		return nil, err
 	}
+	token.SessionID = sessionID
 
-	// Cache it
-	hostClient := p.hostClient(ctx)
-	if hostClient != nil {
-		cacheKey := buildCacheKey(auth.FlowServicePrincipal, fingerprint, scope)
-		if cacheSetErr := cacheSet(ctx, hostClient, cacheKey, token); cacheSetErr != nil {
-			lgr.V(1).Info("failed to cache SA token", "error", cacheSetErr)
-		}
-	}
+	// Cache it if the session is still current
+	p.cacheTokenForSession(ctx, cacheKey, token)
 
 	return token, nil
 }
 
 // serviceAccountStatus returns the status for SA authentication.
-func (p *Plugin) serviceAccountStatus(_ context.Context) (*auth.Status, error) {
-	key, err := GetServiceAccountKey()
+func (p *Plugin) serviceAccountStatus(ctx context.Context) (*auth.Status, error) {
+	cfg, err := p.effectiveConfig(ctx)
 	if err != nil {
+		return nil, err
+	}
+	return p.serviceAccountStatusForConfig(cfg)
+}
+
+func (p *Plugin) serviceAccountStatusForConfig(cfg *Config) (*auth.Status, error) {
+	key, err := p.getServiceAccountKeyForConfig(cfg)
+	if err != nil {
+		reason := ""
+		if !errors.Is(err, ErrNoServiceAccountConfigured) {
+			reason = err.Error()
+		}
 		return &auth.Status{ //nolint:nilerr // intentional: credential read errors mean not authenticated
 			Authenticated: false,
+			Flow:          auth.FlowServicePrincipal,
+			Reason:        reason,
 		}, nil
 	}
+	return p.serviceAccountStatusFromKey(cfg, key), nil
+}
 
+func (p *Plugin) serviceAccountStatusFromKey(cfg *Config, key *ServiceAccountKey) *auth.Status {
+	var impersonated string
+	if cfg != nil {
+		impersonated = cfg.ImpersonateServiceAccount
+	}
 	return &auth.Status{
 		Authenticated: true,
+		Flow:          auth.FlowServicePrincipal,
+		ClientID:      impersonated,
 		Claims: &auth.Claims{
 			Issuer:   "https://accounts.google.com",
 			Subject:  key.ClientEmail,
@@ -274,5 +359,5 @@ func (p *Plugin) serviceAccountStatus(_ context.Context) (*auth.Status, error) {
 			Name:     fmt.Sprintf("Service Account (%s)", key.ClientEmail),
 		},
 		IdentityType: auth.IdentityTypeServicePrincipal,
-	}, nil
+	}
 }

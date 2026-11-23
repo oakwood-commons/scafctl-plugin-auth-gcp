@@ -43,7 +43,13 @@ func TestGetAuthHandlers(t *testing.T) {
 	assert.Equal(t, HandlerName, handlers[0].Name)
 	assert.Equal(t, HandlerDisplayName, handlers[0].DisplayName)
 	assert.Len(t, handlers[0].Flows, 6)
-	assert.Len(t, handlers[0].Capabilities, 4)
+	assert.Equal(t, []auth.Capability{
+		auth.CapScopesOnLogin,
+		auth.CapScopesOnTokenRequest,
+		auth.CapFederatedToken,
+		auth.CapCallbackPort,
+		auth.CapFlowOverride,
+	}, handlers[0].Capabilities)
 }
 
 func TestConfigureAuthHandler(t *testing.T) {

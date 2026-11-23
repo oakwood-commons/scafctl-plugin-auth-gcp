@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -25,11 +27,47 @@ const (
 	authorizationEndpoint = "https://accounts.google.com/o/oauth2/v2/auth"
 	tokenEndpoint         = "https://oauth2.googleapis.com/token" //nolint:gosec // G117: not a credential, it's an endpoint URL
 	revokeEndpoint        = "https://oauth2.googleapis.com/revoke"
+
+	// callbackShutdownTimeout bounds graceful draining of the localhost callback
+	// HTTP response after a callback result is settled.
+	callbackShutdownTimeout = 5 * time.Second
+
+	// minUnprivilegedPort and maxTCPPort bound caller-requested callback ports
+	// per sdkplugin.LoginRequest.CallbackPort.
+	minUnprivilegedPort = 1024
+	maxTCPPort          = 65535
 )
 
-// defaultBrowserOpener opens a URL in the user's default browser.
-func defaultBrowserOpener(ctx context.Context, url string) error {
-	return oauth.OpenBrowser(ctx, url)
+type browserPreferenceKeyType struct{}
+
+func withBrowserPreference(ctx context.Context, browser string) context.Context {
+	return context.WithValue(ctx, browserPreferenceKeyType{}, browser)
+}
+
+func browserPreferenceFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(browserPreferenceKeyType{}).(string)
+	return v
+}
+
+// defaultBrowserOpener opens a URL in the user's preferred or default browser,
+// logging fallback warnings when a configured browser preference or $BROWSER
+// cannot be launched.
+func defaultBrowserOpener(ctx context.Context, rawURL string) error {
+	return oauth.OpenBrowserWithPreference(
+		ctx,
+		rawURL,
+		browserPreferenceFromContext(ctx),
+		oauth.WithWarningHandler(func(msg string) {
+			logr.FromContextOrDiscard(ctx).V(0).Info(msg)
+		}),
+	)
+}
+
+func normalizeCallbackPort(port int) int {
+	if port < minUnprivilegedPort || port > maxTCPPort {
+		return 0
+	}
+	return port
 }
 
 // adcLogin performs the ADC browser OAuth flow (authorization code + PKCE).
@@ -37,9 +75,20 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("starting ADC browser OAuth flow", "handler", HandlerName)
 
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = withResolvedConfig(ctx, cfg)
+
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	// Use configured client ID, or fall back to Google's well-known ADC client credentials
-	clientID := p.config.ClientID
-	clientSecret := p.config.ClientSecret
+	clientID := cfg.ClientID
+	clientSecret := cfg.ClientSecret
 	if clientID == "" {
 		lgr.V(1).Info("no client ID configured, using Google's default ADC client credentials")
 		clientID = DefaultADCClientID
@@ -49,7 +98,7 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 	// Determine scopes
 	scopes := req.Scopes
 	if len(scopes) == 0 {
-		scopes = p.config.DefaultScopes
+		scopes = cfg.DefaultScopes
 	}
 	scopeStr := strings.Join(scopes, " ")
 
@@ -60,26 +109,60 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 	}
 	codeChallenge := oauth.GenerateCodeChallenge(codeVerifier)
 
-	// Start local callback server for OAuth redirect
-	callbackServer, err := oauth.StartCallbackServer(ctx, 0, "")
+	// Generate random OAuth state for CSRF protection
+	state, err := oauth.GenerateCodeVerifier()
+	if err != nil {
+		return nil, fmt.Errorf("generating OAuth state: %w", err)
+	}
+
+	// Start local callback server with deferred completion and Blueprint HTML pages
+	callbackOpts := []oauth.CallbackOption{oauth.WithDeferredCompletion()}
+	if pages := p.callbackPages(); pages != nil {
+		callbackOpts = append(callbackOpts, oauth.WithCallbackPages(oauth.CallbackPages{
+			SuccessHTML: pages.SuccessHTML,
+			FailureHTML: pages.FailureHTML,
+		}))
+	}
+
+	callbackPort := normalizeCallbackPort(req.CallbackPort)
+	callbackServer, err := oauth.StartCallbackServer(ctx, callbackPort, state, callbackOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("starting callback server: %w", err)
 	}
-	defer func() { _ = callbackServer.Close() }()
+
+	drained := false
+	drainCallbackServer := func() {
+		if drained {
+			return
+		}
+		drained = true
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), callbackShutdownTimeout)
+		defer shutdownCancel()
+		_ = callbackServer.Shutdown(shutdownCtx)
+	}
+	defer drainCallbackServer()
+
+	settleCallback := func(success bool) {
+		callbackServer.Complete(success)
+		drainCallbackServer()
+	}
+
 	redirectURI := callbackServer.RedirectURI
 
 	// Build authorization URL
-	authURL := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&code_challenge=%s&code_challenge_method=S256&access_type=offline&prompt=consent",
+	authURL := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&code_challenge=%s&code_challenge_method=S256&state=%s&access_type=offline&prompt=consent",
 		authorizationEndpoint,
 		url.QueryEscape(clientID),
 		url.QueryEscape(redirectURI),
 		url.QueryEscape(scopeStr),
 		url.QueryEscape(codeChallenge),
+		url.QueryEscape(state),
 	)
 
-	// Open browser
-	lgr.V(1).Info("opening browser for authentication", "url", authURL)
-	browserOpenErr := p.openBrowser(ctx, authURL)
+	// Open browser, forwarding any caller-requested browser preference
+	lgr.V(1).Info("opening browser for authentication", "url", authURL, "browser", req.Browser)
+	opener := p.browserOpener()
+	browserOpenErr := opener(withBrowserPreference(ctx, req.Browser), authURL)
 	if browserOpenErr != nil {
 		lgr.V(0).Info("failed to open browser, please open this URL manually", "url", authURL)
 	}
@@ -96,7 +179,7 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 	// Wait for authorization code or timeout
 	timeout := req.Timeout
 	if timeout == 0 {
-		timeout = 5 * time.Minute
+		timeout = DefaultTimeout
 	}
 
 	timer := time.NewTimer(timeout)
@@ -106,13 +189,16 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 	select {
 	case result := <-callbackServer.ResultChan():
 		if result.Err != nil {
+			drainCallbackServer()
 			return nil, result.Err
 		}
 		authCode = result.Code
 		lgr.V(1).Info("received authorization code")
 	case <-timer.C:
+		settleCallback(false)
 		return nil, fmt.Errorf("authentication timed out: no response received from browser: %w", ErrTimeout)
 	case <-ctx.Done():
+		settleCallback(false)
 		return nil, fmt.Errorf("authentication cancelled: %w", ErrUserCancelled)
 	}
 
@@ -127,60 +213,78 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 	data.Set("grant_type", "authorization_code")
 	data.Set("code_verifier", codeVerifier)
 
-	resp, err := p.httpClient.PostForm(ctx, tokenEndpoint, data)
+	resp, err := httpClient.PostForm(ctx, tokenEndpoint, data)
 	if err != nil {
+		settleCallback(false)
 		return nil, fmt.Errorf("token exchange failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		var errResp TokenErrorResponse
-		_ = json.NewDecoder(resp.Body).Decode(&errResp)
-		return nil, fmt.Errorf("token exchange failed: %s - %s", errResp.Error, errResp.ErrorDescription)
+		_ = json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&errResp)
+		settleCallback(false)
+		if errResp.Error != "" {
+			return nil, fmt.Errorf("token exchange failed: %s - %s",
+				sanitizeControlChars(errResp.Error), sanitizeControlChars(errResp.ErrorDescription))
+		}
+		return nil, fmt.Errorf("token exchange failed with HTTP %d", resp.StatusCode)
 	}
 
 	var tokenResp TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&tokenResp); err != nil {
+		settleCallback(false)
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
-
-	// Store credentials
-	if err := p.storeCredentials(ctx, &tokenResp, auth.FlowInteractive, scopes, "", clientID); err != nil {
-		return nil, fmt.Errorf("failed to store credentials: %w", err)
+	if tokenResp.AccessToken == "" {
+		settleCallback(false)
+		return nil, fmt.Errorf("token exchange failed: token endpoint returned empty access_token")
 	}
 
-	// Cache the access token. Use empty scope in key because mintToken/refresh
-	// never passes scope to Google — the token always covers all authorized scopes.
-	if tokenResp.AccessToken != "" {
-		expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-		hostClient := p.hostClient(ctx)
-		if hostClient != nil {
-			cacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(clientID), "")
-			_ = cacheSet(ctx, hostClient, cacheKey, &auth.Token{
-				AccessToken: tokenResp.AccessToken,
-				TokenType:   tokenResp.TokenType,
-				ExpiresAt:   expiresAt,
-				Scope:       scopeStr,
-				Flow:        auth.FlowInteractive,
-			})
+	// Validate and extract claims before mutating stored credentials so a
+	// malformed ID token serves FailureHTML without leaving partial state.
+	var claims *auth.Claims
+	if tokenResp.IDToken != "" {
+		claims, err = extractClaimsFromIDToken(tokenResp.IDToken)
+		if err != nil {
+			settleCallback(false)
+			return nil, fmt.Errorf("failed to extract claims from ID token: %w", err)
 		}
-	}
-
-	// Extract claims
-	claims, err := extractClaims(&tokenResp)
-	if err != nil {
-		// Try userinfo endpoint as fallback
-		if tokenResp.AccessToken != "" {
-			claims, err = p.fetchUserinfoClaims(ctx, tokenResp.AccessToken)
-			if err != nil {
-				claims = &auth.Claims{Issuer: "https://accounts.google.com"}
+	} else {
+		claims, err = p.fetchUserinfoClaimsWithClient(ctx, httpClient, tokenResp.AccessToken)
+		if err != nil {
+			if ctx.Err() != nil {
+				settleCallback(false)
+				if ctx.Err() == context.DeadlineExceeded {
+					return nil, fmt.Errorf("authentication timed out: %w", ErrTimeout)
+				}
+				return nil, fmt.Errorf("authentication cancelled: %w", ErrUserCancelled)
 			}
-		} else {
 			claims = &auth.Claims{Issuer: "https://accounts.google.com"}
 		}
 	}
 
 	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	// Use empty scope in key because mintToken/refresh never passes scope to
+	// Google -- the token always covers all authorized scopes.
+	initialCacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(clientID), "")
+	initialToken := &auth.Token{
+		AccessToken: tokenResp.AccessToken,
+		TokenType:   tokenResp.TokenType,
+		ExpiresAt:   expiresAt,
+		Scope:       scopeStr,
+		Flow:        auth.FlowInteractive,
+	}
+
+	// Atomically commit credentials, clear stale cached tokens, and seed the new
+	// access token under the profile write lock before settling SuccessHTML.
+	_, err = p.storeCredentialsAndSeedToken(ctx, cfg, &tokenResp, auth.FlowInteractive, scopes, "", clientID, claims, initialCacheKey, initialToken)
+	if err != nil {
+		settleCallback(false)
+		return nil, fmt.Errorf("failed to store credentials: %w", err)
+	}
+
+	settleCallback(true)
 
 	lgr.V(1).Info("ADC browser OAuth flow completed successfully",
 		"email", claims.Email,
@@ -198,19 +302,23 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("minting access token", "scope", scope)
 
-	refreshToken, err := p.loadRefreshToken(ctx)
+	cfg, err := p.effectiveConfig(ctx)
 	if err != nil {
-		return nil, ErrNotAuthenticated
+		return nil, err
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
 
-	metadata, err := p.loadMetadata(ctx)
+	refreshToken, metadata, err := p.loadSessionCredentials(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load metadata: %w", err)
+		return nil, err
 	}
 
 	// For ADC flow, use the stored client ID as primary source, then fall
-	// back to the default ADC client (not p.config) so a config change
-	// between runs cannot break refresh.
+	// back to the default ADC client (not cfg) so a config change between
+	// runs cannot break refresh.
 	clientID := metadata.ClientID
 	var clientSecret string
 	switch clientID {
@@ -220,7 +328,7 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 	case DefaultADCClientID:
 		clientSecret = DefaultADCClientSecret
 	default:
-		clientSecret = p.config.ClientSecret
+		clientSecret = cfg.ClientSecret
 	}
 
 	data := url.Values{}
@@ -231,49 +339,55 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 	}
 	data.Set("refresh_token", refreshToken)
 
-	resp, err := p.httpClient.PostForm(ctx, tokenEndpoint, data)
+	resp, err := httpClient.PostForm(ctx, tokenEndpoint, data)
 	if err != nil {
 		return nil, fmt.Errorf("token refresh failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		var errResp TokenErrorResponse
-		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		_ = json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&errResp)
 
 		bin := p.binaryName()
 		if errResp.Error == "invalid_grant" {
-			_ = p.logoutInternal(ctx)
+			p.logoutIfSessionMatches(ctx, metadata.SessionID)
 			return nil, fmt.Errorf(
 				"GCP credentials have expired or been revoked (%s). "+
 					"Run: %s auth login %s: %w",
-				errResp.ErrorDescription, bin, HandlerName, ErrTokenExpired)
+				sanitizeControlChars(errResp.ErrorDescription), bin, HandlerName, ErrTokenExpired)
 		}
 		return nil, fmt.Errorf(
 			"token refresh failed: %s - %s. Run: %s auth login %s to re-authenticate",
-			errResp.Error, errResp.ErrorDescription, bin, HandlerName)
+			sanitizeControlChars(errResp.Error), sanitizeControlChars(errResp.ErrorDescription), bin, HandlerName)
 	}
 
 	var tokenResp TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
+	if tokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("token refresh failed: token endpoint returned empty access_token")
+	}
 
-	// Handle refresh token rotation
+	// Handle refresh token rotation unless a concurrent login replaced the session
 	if tokenResp.RefreshToken != "" && tokenResp.RefreshToken != refreshToken {
 		lgr.V(1).Info("refresh token rotated, storing new token")
-		if storeErr := p.storeCredentials(ctx, &tokenResp, auth.FlowInteractive, metadata.Scopes, metadata.SessionID, clientID); storeErr != nil {
+		if storeErr := p.storeRotatedCredentials(ctx, cfg, &tokenResp, metadata, clientID); storeErr != nil {
 			lgr.V(1).Info("warning: failed to update refresh token", "error", storeErr)
 		}
 	}
 
 	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 
-	// Use the scope from the token response when available, since the refresh
-	// request may not echo back the exact requested scope.
 	effectiveScope := scope
 	if tokenResp.Scope != "" {
 		effectiveScope = tokenResp.Scope
+	}
+
+	userFlow := metadata.Flow
+	if userFlow == "" {
+		userFlow = auth.FlowInteractive
 	}
 
 	return &auth.Token{
@@ -281,56 +395,67 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 		TokenType:   tokenResp.TokenType,
 		ExpiresAt:   expiresAt,
 		Scope:       effectiveScope,
-		Flow:        auth.FlowInteractive,
+		Flow:        userFlow,
 		SessionID:   metadata.SessionID,
 	}, nil
 }
 
 // getStoredRefreshToken gets a token using the stored refresh token, with caching.
 func (p *Plugin) getStoredRefreshToken(ctx context.Context, scope string, forceRefresh bool) (*auth.Token, error) {
+	return p.getStoredRefreshTokenWithMinValidFor(ctx, scope, forceRefresh, DefaultMinValidFor)
+}
+
+func (p *Plugin) getStoredRefreshTokenWithMinValidFor(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
-	// Determine the flow from stored metadata so we can partition the cache.
+	if minValidFor <= 0 {
+		minValidFor = DefaultMinValidFor
+	}
+
 	var userFlow auth.Flow
 	var storedClientID string
+	var sessionID string
 	if metadata, err := p.loadMetadata(ctx); err == nil && metadata != nil {
 		userFlow = metadata.Flow
 		storedClientID = metadata.ClientID
+		sessionID = metadata.SessionID
+	}
+	if userFlow == "" {
+		userFlow = auth.FlowInteractive
 	}
 	if storedClientID == "" {
 		storedClientID = DefaultADCClientID
 	}
 
 	fingerprint := fingerprintHash(storedClientID)
+	prefix := p.tokenCachePrefix(ctx)
 
 	// Check cache first. Use empty scope in key because mintToken/refresh never
-	// passes scope to Google — the token always covers all authorized scopes.
+	// passes scope to Google -- the token always covers all authorized scopes.
 	if !forceRefresh {
-		hostClient := p.hostClient(ctx)
-		if hostClient != nil {
+		if hostClient := p.hostClient(ctx); hostClient != nil {
 			cacheKey := buildCacheKey(userFlow, fingerprint, "")
-			cached, cacheErr := cacheGet(ctx, hostClient, cacheKey)
-			if cacheErr == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
-				lgr.V(1).Info("using cached token", "scope", scope)
-				return cached, nil
+			cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
+			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) {
+				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
+					lgr.V(1).Info("using cached token", "scope", scope)
+					return cached, nil
+				}
 			}
 		}
 	}
 
-	// Mint new token via refresh
 	token, err := p.mintToken(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
 
-	// Cache the token
-	hostClient := p.hostClient(ctx)
-	if hostClient != nil {
-		cacheKey := buildCacheKey(userFlow, fingerprint, "")
-		if cacheSetErr := cacheSet(ctx, hostClient, cacheKey, token); cacheSetErr != nil {
-			lgr.V(1).Info("failed to cache token", "error", cacheSetErr)
-		}
+	mintedClientID := storedClientID
+	if metadata, metaErr := p.loadMetadata(ctx); metaErr == nil && metadata != nil && metadata.ClientID != "" {
+		mintedClientID = metadata.ClientID
 	}
+	cacheKey := buildCacheKey(token.Flow, fingerprintHash(mintedClientID), "")
+	p.cacheTokenForSession(ctx, cacheKey, token)
 
 	return token, nil
 }
@@ -338,14 +463,29 @@ func (p *Plugin) getStoredRefreshToken(ctx context.Context, scope string, forceR
 // revokeRefreshToken revokes the stored refresh token with Google.
 func (p *Plugin) revokeRefreshToken(ctx context.Context) error {
 	refreshToken, err := p.loadRefreshToken(ctx)
+	if err != nil || refreshToken == "" {
+		return nil //nolint:nilerr // no refresh token to revoke
+	}
+	return p.revokeRefreshTokenValue(ctx, refreshToken)
+}
+
+func (p *Plugin) revokeRefreshTokenValue(ctx context.Context, refreshToken string) error {
+	if refreshToken == "" {
+		return nil
+	}
+	cfg, err := p.effectiveConfig(ctx)
 	if err != nil {
-		return nil // No refresh token to revoke
+		cfg = p.baseConfig()
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("token revocation failed: %w", err)
 	}
 
 	data := url.Values{}
 	data.Set("token", refreshToken)
 
-	resp, err := p.httpClient.PostForm(ctx, revokeEndpoint, data)
+	resp, err := httpClient.PostForm(ctx, revokeEndpoint, data)
 	if err != nil {
 		return fmt.Errorf("token revocation failed: %w", err)
 	}
