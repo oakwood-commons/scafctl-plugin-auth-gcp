@@ -138,6 +138,32 @@ func (p *Plugin) getImpersonatedToken(ctx context.Context, sourceAccessToken, sc
 	return p.getImpersonatedTokenWithSource(ctx, &auth.Token{AccessToken: sourceAccessToken}, scope, forceRefresh, DefaultMinValidFor)
 }
 
+func (p *Plugin) impersonationSourceIdentity(cfg *Config, flow auth.Flow, matchedMetadata *TokenMetadata) string {
+	switch flow { //nolint:exhaustive // only credential-file/OAuth client flows need extra disambiguation
+	case auth.FlowServicePrincipal:
+		if key, err := p.getServiceAccountKeyForConfig(cfg); err == nil && key != nil {
+			return key.ClientEmail
+		}
+	case auth.FlowWorkloadIdentity:
+		if extCfg, err := p.getExternalAccountConfigForConfig(cfg); err == nil && extCfg != nil {
+			return workloadIdentityFingerprint(extCfg)
+		}
+	case auth.FlowGcloudADC:
+		if creds, err := LoadGcloudADCCredentials(); err == nil && creds != nil {
+			return creds.ClientID + "|" + fingerprintHash(creds.RefreshToken)
+		}
+	case auth.FlowInteractive, auth.FlowDeviceCode:
+		if matchedMetadata != nil && matchedMetadata.ClientID != "" {
+			return matchedMetadata.ClientID
+		}
+		if cfg != nil && cfg.ClientID != "" {
+			return cfg.ClientID
+		}
+		return DefaultADCClientID
+	}
+	return ""
+}
+
 func (p *Plugin) getImpersonatedTokenWithSource(ctx context.Context, sourceToken *auth.Token, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
@@ -160,40 +186,57 @@ func (p *Plugin) getImpersonatedTokenWithSource(ctx context.Context, sourceToken
 
 	var sessionID string
 	var effectiveFlow auth.Flow
+	var hasExplicitSourceFlow bool
+	var matchedMetadata *TokenMetadata
 	if sourceToken != nil {
 		sessionID = sourceToken.SessionID
 		effectiveFlow = sourceToken.Flow
+		hasExplicitSourceFlow = sourceToken.Flow != ""
 	}
 	if metadata, metaErr := p.loadMetadata(ctx); metaErr == nil && metadata != nil {
-		if sessionID == "" {
-			sessionID = metadata.SessionID
-		}
-		if effectiveFlow == "" {
-			effectiveFlow = metadata.Flow
+		// Only inherit stored metadata when sourceToken had no flow or matches
+		// the stored session's flow -- never attach an interactive session's ID
+		// to a per-RPC SA/WIF override token.
+		if !hasExplicitSourceFlow || metadata.Flow == effectiveFlow {
+			matchedMetadata = metadata
+			if sessionID == "" && !hasExplicitSourceFlow {
+				sessionID = metadata.SessionID
+			} else if sessionID == "" && (effectiveFlow == auth.FlowInteractive || effectiveFlow == auth.FlowDeviceCode || effectiveFlow == auth.FlowMetadata || effectiveFlow == auth.FlowGcloudADC) {
+				sessionID = metadata.SessionID
+			}
+			if effectiveFlow == "" {
+				effectiveFlow = metadata.Flow
+			}
 		}
 	}
 	if effectiveFlow == "" {
 		effectiveFlow = auth.FlowInteractive
 	}
 
-	// Check cache for impersonated token in ctx's profile
+	// Partition impersonated token cache by target SA AND source identity/session
+	// (preserving targetSA-only fingerprint only for legacy direct getImpersonatedToken
+	// helper calls where neither sourceToken.Flow nor stored metadata is present).
 	impersonateFingerprint := fingerprintHash(targetSA)
+	if hasExplicitSourceFlow || sessionID != "" {
+		impersonateFingerprint = fingerprintHash(
+			targetSA + "|" + string(effectiveFlow) + "|" + sessionID + "|" + p.impersonationSourceIdentity(cfg, effectiveFlow, matchedMetadata),
+		)
+	}
+
 	prefix := p.tokenCachePrefix(ctx)
 	cacheKey := buildCacheKey("impersonation", impersonateFingerprint, scope)
 	if !forceRefresh {
 		if hostClient := p.hostClient(ctx); hostClient != nil {
 			cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
-			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) {
-				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
-					if cached.Flow == "" || cached.Flow == auth.Flow("impersonation") {
-						cached.Flow = effectiveFlow
-					}
-					lgr.V(1).Info("using cached impersonated token",
-						"targetServiceAccount", targetSA,
-						"scope", scope,
-					)
-					return cached, nil
+			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) && cached.SessionID == sessionID {
+				if cached.Flow == "" || cached.Flow == auth.Flow("impersonation") {
+					cached.Flow = effectiveFlow
 				}
+				lgr.V(1).Info("using cached impersonated token",
+					"targetServiceAccount", targetSA,
+					"scope", scope,
+				)
+				return cached, nil
 			}
 		}
 	}

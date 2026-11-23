@@ -94,11 +94,6 @@ func (p *Plugin) getServiceAccountKeyForConfig(cfg *Config) (*ServiceAccountKey,
 	return getServiceAccountKeyFromPath(os.Getenv(EnvGoogleApplicationCredentials), false)
 }
 
-func (p *Plugin) hasServiceAccountCredentialsForConfig(cfg *Config) bool {
-	_, err := p.getServiceAccountKeyForConfig(cfg)
-	return err == nil
-}
-
 // serviceAccountLogin validates SA credentials by acquiring a token.
 func (p *Plugin) serviceAccountLogin(ctx context.Context, req sdkplugin.LoginRequest) (*sdkplugin.LoginResponse, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
@@ -143,7 +138,7 @@ func (p *Plugin) serviceAccountLogin(ctx context.Context, req sdkplugin.LoginReq
 
 	cacheKey := buildCacheKey(auth.FlowServicePrincipal, fingerprintHash(key.ClientEmail), scope)
 	if _, err := p.storeMetadataAndSeedToken(ctx, claims, auth.FlowServicePrincipal, scopes, cacheKey, token); err != nil {
-		lgr.V(1).Info("warning: failed to store metadata", "error", err)
+		return nil, fmt.Errorf("failed to store metadata: %w", err)
 	}
 
 	lgr.V(1).Info("service account authentication successful",
@@ -287,7 +282,7 @@ func (p *Plugin) getServiceAccountTokenWithMinValidFor(ctx context.Context, scop
 
 	fingerprint := fingerprintHash(key.ClientEmail)
 	prefix := p.tokenCachePrefix(ctx)
-	sessionID := p.readFlowSessionID(ctx, auth.FlowServicePrincipal)
+	sessionID := p.readFlowSessionID(ctx, auth.FlowServicePrincipal, key.ClientEmail)
 	cacheKey := buildCacheKey(auth.FlowServicePrincipal, fingerprint, scope)
 
 	// Check cache first
@@ -296,6 +291,9 @@ func (p *Plugin) getServiceAccountTokenWithMinValidFor(ctx context.Context, scop
 			cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
 			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) {
 				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
+					if cached.Flow == "" {
+						cached.Flow = auth.FlowServicePrincipal
+					}
 					lgr.V(1).Info("using cached SA token", "scope", scope)
 					return cached, nil
 				}

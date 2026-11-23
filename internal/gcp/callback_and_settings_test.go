@@ -49,8 +49,16 @@ func clearAmbientGCPEnv(t *testing.T) {
 }
 
 func makeTestIDToken(claims map[string]any) string {
+	merged := map[string]any{
+		"iss": "https://accounts.google.com",
+		"aud": DefaultADCClientID,
+		"exp": time.Now().Add(time.Hour).Unix(),
+	}
+	for k, v := range claims {
+		merged[k] = v
+	}
 	header, _ := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT"})
-	payload, _ := json.Marshal(claims)
+	payload, _ := json.Marshal(merged)
 	return base64.RawURLEncoding.EncodeToString(header) + "." +
 		base64.RawURLEncoding.EncodeToString(payload) + "." +
 		base64.RawURLEncoding.EncodeToString([]byte("sig"))
@@ -121,6 +129,7 @@ type blockingHTTPClient struct {
 	mu       sync.Mutex
 	lastData url.Values
 	onPost   func(ctx context.Context, endpoint string, data url.Values) (*http.Response, error)
+	onDo     func(ctx context.Context, req *http.Request) (*http.Response, error)
 }
 
 func (b *blockingHTTPClient) PostForm(ctx context.Context, endpoint string, data url.Values) (*http.Response, error) {
@@ -134,7 +143,10 @@ func (b *blockingHTTPClient) Get(_ context.Context, _ string, _ map[string]strin
 	return jsonHTTPResponse(http.StatusOK, map[string]any{"sub": "sub-1", "email": "user@example.com"}), nil
 }
 
-func (b *blockingHTTPClient) Do(_ context.Context, _ *http.Request) (*http.Response, error) {
+func (b *blockingHTTPClient) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	if b.onDo != nil {
+		return b.onDo(ctx, req)
+	}
 	return jsonHTTPResponse(http.StatusInternalServerError, map[string]string{"error": "unexpected Do"}), nil
 }
 
@@ -916,6 +928,7 @@ func TestStatelessPerRPCSettingsAndProfiles(t *testing.T) {
 						TokenType:    "Bearer",
 						ExpiresIn:    3600,
 						IDToken: makeTestIDToken(map[string]any{
+							"aud":   clientID,
 							"sub":   "sub-" + clientID,
 							"email": clientID + "@example.com",
 						}),
@@ -1730,12 +1743,11 @@ func TestGetStatus_ReadOnlyInvariantAndImpersonationOverride(t *testing.T) {
 	}
 	fake.mu.Unlock()
 
-	// 1. Uncached 200 OK refresh probe (even with rotated refresh_token!) must NOT mutate secrets/cache
+	// 1. Uncached non-rotating 200 OK refresh probe must NOT mutate secrets/cache
 	mockHTTP.AddResponse(http.StatusOK, TokenResponse{
-		AccessToken:  "probed-at",
-		RefreshToken: "rotated-during-status-rt",
-		TokenType:    "Bearer",
-		ExpiresIn:    3600,
+		AccessToken: "probed-at",
+		TokenType:   "Bearer",
+		ExpiresIn:   3600,
 	})
 	st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
@@ -1743,7 +1755,31 @@ func TestGetStatus_ReadOnlyInvariantAndImpersonationOverride(t *testing.T) {
 	assert.Equal(t, "stored-sa@proj.iam.gserviceaccount.com", st.ClientID)
 
 	fake.mu.Lock()
-	assert.Equal(t, before, fake.secrets, "GetStatus 200 probe must not write cached tokens or rotate secrets")
+	assert.Equal(t, before, fake.secrets, "GetStatus non-rotating 200 probe must not write cached tokens or mutate secrets")
+	fake.mu.Unlock()
+
+	// 1b. If Google rotates refresh_token during GetStatus probe, persist rotated refresh_token
+	// safely so a one-time refresh grant is not lost, without populating the access-token cache.
+	mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+		AccessToken:  "probed-at-rot",
+		RefreshToken: "rotated-during-status-rt",
+		TokenType:    "Bearer",
+		ExpiresIn:    3600,
+	})
+	stRot, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+	require.NoError(t, err)
+	assert.True(t, stRot.Authenticated)
+	_, curRT, hasRT, err := p.inspectStoredMetadataAndRefresh(context.Background())
+	require.NoError(t, err)
+	require.True(t, hasRT)
+	assert.Equal(t, "rotated-during-status-rt", curRT)
+
+	fake.mu.Lock()
+	afterRot := make(map[string]string, len(fake.secrets))
+	for k, v := range fake.secrets {
+		afterRot[k] = v
+		assert.False(t, strings.HasPrefix(k, SecretKeyTokenPrefix), "GetStatus must not populate access-token cache")
+	}
 	fake.mu.Unlock()
 
 	// 2. Per-RPC settings override and clear impersonateServiceAccount
@@ -1772,7 +1808,7 @@ func TestGetStatus_ReadOnlyInvariantAndImpersonationOverride(t *testing.T) {
 	assert.Equal(t, "expired or revoked", stRevoked.Reason)
 
 	fake.mu.Lock()
-	assert.Equal(t, before, fake.secrets, "GetStatus invalid_grant probe must not delete stored credentials")
+	assert.Equal(t, afterRot, fake.secrets, "GetStatus invalid_grant probe must not delete stored credentials")
 	fake.mu.Unlock()
 }
 
@@ -1880,7 +1916,7 @@ func TestSessionRotation_InconsistentSession_ConcurrentLogout_AndHelpers(t *test
 		require.NoError(t, p.storeRotatedCredentials(context.Background(), DefaultConfig(), &TokenResponse{
 			AccessToken:  "at-2",
 			RefreshToken: "rt-2",
-		}, origMeta, DefaultADCClientID))
+		}, origMeta, "rt-1", DefaultADCClientID))
 
 		rotMeta, rt, hasRT, err := p.inspectStoredMetadataAndRefresh(context.Background())
 		require.NoError(t, err)
@@ -1888,6 +1924,25 @@ func TestSessionRotation_InconsistentSession_ConcurrentLogout_AndHelpers(t *test
 		assert.Equal(t, "rt-2", rt)
 		assert.Equal(t, "keep-proj", rotMeta.Project)
 		assert.Equal(t, "keep-sa@proj.iam.gserviceaccount.com", rotMeta.ImpersonateServiceAccount)
+
+		// Concurrent late rotation carrying superseded revision (same SessionID "sess-rot-1",
+		// old RefreshTokenID/Hash from origMeta) must NOT overwrite rt-2!
+		require.NoError(t, p.storeRotatedCredentials(context.Background(), DefaultConfig(), &TokenResponse{
+			AccessToken:  "late-at",
+			RefreshToken: "late-rt",
+		}, origMeta, "rt-1", DefaultADCClientID))
+		afterLateMeta, afterLateRT, _, err := p.inspectStoredMetadataAndRefresh(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "rt-2", afterLateRT)
+		assert.Equal(t, rotMeta.RefreshTokenID, afterLateMeta.RefreshTokenID)
+
+		// Late invalid_grant carrying superseded revision (same SessionID "sess-rot-1",
+		// old RefreshTokenID/Hash from origMeta) must NOT wipe the rotated session!
+		p.logoutIfRefreshRevisionMatches(context.Background(), origMeta.SessionID, origMeta.RefreshTokenID, origMeta.RefreshTokenHash, "rt-1")
+		_, stillRT, stillHasRT, err := p.inspectStoredMetadataAndRefresh(context.Background())
+		require.NoError(t, err)
+		require.True(t, stillHasRT)
+		assert.Equal(t, "rt-2", stillRT)
 
 		// Replace session with sess-rot-2; stale rotation for sess-rot-1 must be a no-op
 		_, err = p.storeCredentialsWithClaims(context.Background(), DefaultConfig(), &TokenResponse{
@@ -1899,7 +1954,7 @@ func TestSessionRotation_InconsistentSession_ConcurrentLogout_AndHelpers(t *test
 		require.NoError(t, p.storeRotatedCredentials(context.Background(), DefaultConfig(), &TokenResponse{
 			AccessToken:  "stale-at",
 			RefreshToken: "stale-rt",
-		}, origMeta, DefaultADCClientID))
+		}, rotMeta, "rt-2", DefaultADCClientID))
 
 		curMeta, curRT, _, err := p.inspectStoredMetadataAndRefresh(context.Background())
 		require.NoError(t, err)
@@ -2019,5 +2074,630 @@ func TestSessionRotation_InconsistentSession_ConcurrentLogout_AndHelpers(t *test
 		assert.Equal(t, "bad [31mrederror", sanitizeControlChars("  bad\r\n\t\x1b[31mred\x00\u202e\u0085\u009b"+string([]byte{0xff})+"error  "))
 		longInput := strings.Repeat("a", 600)
 		assert.Len(t, sanitizeControlChars(longInput), 512)
+	})
+}
+
+func TestCredentialValidationAndSessionIsolation(t *testing.T) {
+	t.Run("rejects ID tokens with wrong issuer, wrong audience, mismatched azp, missing sub, expired exp, future nbf, or invalid JWS across flows", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		badTokens := []struct {
+			name   string
+			claims map[string]any
+		}{
+			{
+				name:   "wrong issuer",
+				claims: map[string]any{"iss": "https://evil.example.com", "sub": "u1"},
+			},
+			{
+				name:   "wrong scalar audience",
+				claims: map[string]any{"aud": "other-client.apps.googleusercontent.com", "sub": "u1"},
+			},
+			{
+				name:   "wrong array audience",
+				claims: map[string]any{"aud": []string{"other-1", "other-2"}, "sub": "u1"},
+			},
+			{
+				name:   "mismatched azp",
+				claims: map[string]any{"azp": "other-azp.apps.googleusercontent.com", "sub": "u1"},
+			},
+			{
+				name:   "missing subject",
+				claims: map[string]any{"sub": "   "},
+			},
+			{
+				name:   "expired exp",
+				claims: map[string]any{"sub": "u1", "exp": time.Now().Add(-5 * time.Minute).Unix()},
+			},
+			{
+				name:   "missing exp",
+				claims: map[string]any{"sub": "u1", "exp": 0},
+			},
+			{
+				name:   "future nbf",
+				claims: map[string]any{"sub": "u1", "nbf": time.Now().Add(5 * time.Minute).Unix()},
+			},
+		}
+
+		for _, tc := range badTokens {
+			t.Run("interactive_"+tc.name, func(t *testing.T) {
+				p, fake, mockHTTP := newTestPlugin(t)
+				_, wantFailure := configureCustomCallbackPages(t, p)
+				mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+					AccessToken:  "at",
+					RefreshToken: "rt",
+					TokenType:    "Bearer",
+					ExpiresIn:    3600,
+					IDToken:      makeTestIDToken(tc.claims),
+				})
+
+				statusCh := make(chan int, 1)
+				bodyCh := make(chan string, 1)
+				p.openBrowser = func(_ context.Context, authURL string) error {
+					u, _ := url.Parse(authURL)
+					redirect := u.Query().Get("redirect_uri")
+					state := u.Query().Get("state")
+					go func() {
+						resp, err := http.Get(redirect + "/?code=IDTOK&state=" + url.QueryEscape(state)) //nolint:noctx
+						if err != nil {
+							statusCh <- 0
+							bodyCh <- ""
+							return
+						}
+						b, _ := io.ReadAll(resp.Body)
+						_ = resp.Body.Close()
+						statusCh <- resp.StatusCode
+						bodyCh <- string(b)
+					}()
+					return nil
+				}
+
+				_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+				require.Error(t, err)
+				assert.Equal(t, http.StatusServiceUnavailable, <-statusCh)
+				assert.Equal(t, wantFailure, <-bodyCh)
+				assert.Empty(t, fake.secrets)
+			})
+
+			t.Run("device_code_"+tc.name, func(t *testing.T) {
+				p, fake, mockHTTP := newTestPlugin(t)
+				p.config.ClientID = "dev-client"
+				p.config.ClientSecret = "dev-secret"
+				claims := make(map[string]any, len(tc.claims)+1)
+				claims["aud"] = "dev-client"
+				for k, v := range tc.claims {
+					claims[k] = v
+				}
+				mockHTTP.AddResponse(http.StatusOK, DeviceCodeResponse{
+					DeviceCode:      "dc",
+					UserCode:        "UC",
+					VerificationURL: "https://accounts.google.com/device",
+					ExpiresIn:       300,
+					Interval:        1,
+				})
+				mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+					AccessToken:  "at",
+					RefreshToken: "rt",
+					TokenType:    "Bearer",
+					ExpiresIn:    3600,
+					IDToken:      makeTestIDToken(claims),
+				})
+
+				_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowDeviceCode}, nil)
+				require.Error(t, err)
+				assert.Empty(t, fake.secrets)
+			})
+		}
+
+		// Valid array audience containing client ID succeeds
+		validArrToken := makeTestIDToken(map[string]any{
+			"iss":   "accounts.google.com",
+			"aud":   []string{"other-aud", DefaultADCClientID},
+			"sub":   "arr-sub",
+			"email": "arr@example.com",
+		})
+		claims, err := validateAndExtractIDTokenClaims(validArrToken, DefaultADCClientID, time.Now())
+		require.NoError(t, err)
+		assert.Equal(t, "arr-sub", claims.Subject)
+	})
+
+	t.Run("corrupt stored metadata or GetSecret error fails closed in GetToken instead of falling back to ambient gcloud_adc or GCE metadata", func(t *testing.T) {
+		dir := t.TempDir()
+		gcloudADCBytes, _ := json.Marshal(map[string]string{
+			"type":          "authorized_user",
+			"client_id":     "gcloud-cid",
+			"client_secret": "gcloud-sec",
+			"refresh_token": "gcloud-rt",
+		})
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "application_default_credentials.json"), gcloudADCBytes, 0o600))
+		t.Setenv(EnvCloudSDKConfig, dir)
+		t.Setenv(EnvGoogleApplicationCredentials, "")
+		t.Setenv(EnvGoogleExternalAccount, "")
+
+		metaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(MetadataTokenResponse{AccessToken: "ambient-gce-at", TokenType: "Bearer", ExpiresIn: 3600})
+		}))
+		t.Cleanup(metaSrv.Close)
+		t.Setenv(EnvGCEMetadataHost, metaSrv.Listener.Addr().String())
+
+		p, fake, mockHTTP := newTestPlugin(t)
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{AccessToken: "ambient-gcloud-at", TokenType: "Bearer", ExpiresIn: 3600})
+
+		// 1. Corrupt metadata JSON
+		fake.secrets[SecretKeyMetadata] = "{corrupt-json"
+		_, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "cloud-platform"})
+		require.ErrorIs(t, err, ErrNotAuthenticated)
+
+		// 2. GetSecret error on metadata
+		delete(fake.secrets, SecretKeyMetadata)
+		fake.getSecretFunc = func(_ context.Context, name string) error {
+			if name == SecretKeyMetadata {
+				return errors.New("secret store unavailable")
+			}
+			return nil
+		}
+		_, err = p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "cloud-platform"})
+		require.ErrorIs(t, err, ErrNotAuthenticated)
+	})
+
+	t.Run("DetectAvailableFlows returns error on broken explicit credential files instead of advertising lower-priority flows", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		p, _, _ := newTestPlugin(t)
+		saCtx := sdkplugin.WithRequestSettings(context.Background(), map[string]json.RawMessage{
+			"serviceAccountKeyFile": json.RawMessage(`"/missing/sa.json"`),
+		})
+		_, err := p.DetectAvailableFlows(saCtx, HandlerName)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "service account credentials error")
+
+		wifCtx := sdkplugin.WithRequestSettings(context.Background(), map[string]json.RawMessage{
+			"externalAccountFile": json.RawMessage(`"/missing/wif.json"`),
+		})
+		_, err = p.DetectAvailableFlows(wifCtx, HandlerName)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "workload identity credentials error")
+	})
+
+	t.Run("impersonation isolates per-RPC SA override from stored interactive session cache and metadata", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		dir := t.TempDir()
+		saFile := filepath.Join(dir, "override-sa.json")
+		saBytes, _ := json.Marshal(ServiceAccountKey{
+			Type:         "service_account",
+			ProjectID:    "proj",
+			PrivateKeyID: "kid",
+			PrivateKey:   generateTestRSAKey(t),
+			ClientEmail:  "override-sa@proj.iam.gserviceaccount.com",
+			ClientID:     "override-cid",
+		})
+		require.NoError(t, os.WriteFile(saFile, saBytes, 0o600))
+
+		p, _, _ := newTestPlugin(t)
+		targetSA := "shared-target@proj.iam.gserviceaccount.com"
+		p.config.ImpersonateServiceAccount = targetSA
+
+		var iamCalls atomic.Int32
+		p.httpClient = &blockingHTTPClient{
+			onDo: func(_ context.Context, _ *http.Request) (*http.Response, error) {
+				n := iamCalls.Add(1)
+				return jsonHTTPResponse(http.StatusOK, ImpersonationResponse{
+					AccessToken: fmt.Sprintf("imp-token-%d", n),
+					ExpireTime:  time.Now().Add(time.Hour).Format(time.RFC3339),
+				}), nil
+			},
+			onPost: func(_ context.Context, _ string, data url.Values) (*http.Response, error) {
+				if data.Get("grant_type") == "authorization_code" {
+					return jsonHTTPResponse(http.StatusOK, TokenResponse{
+						AccessToken:  "interactive-src-at",
+						RefreshToken: "interactive-src-rt",
+						TokenType:    "Bearer",
+						ExpiresIn:    3600,
+						IDToken:      makeTestIDToken(map[string]any{"sub": "int-u", "email": "int@example.com"}),
+					}), nil
+				}
+				return jsonHTTPResponse(http.StatusOK, TokenResponse{
+					AccessToken: "sa-src-at",
+					TokenType:   "Bearer",
+					ExpiresIn:   3600,
+				}), nil
+			},
+		}
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			completeLoopbackCallback(t, authURL, "INT-IMP")
+			return nil
+		}
+
+		// 1. Interactive login + impersonated GetToken caches imp-token-1 under interactive session
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.NoError(t, err)
+		intTok, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "https://www.googleapis.com/auth/cloud-platform"})
+		require.NoError(t, err)
+		assert.Equal(t, "imp-token-1", intTok.AccessToken)
+		assert.Equal(t, auth.FlowInteractive, intTok.Flow)
+		assert.NotEmpty(t, intTok.SessionID)
+
+		// 2. Per-RPC serviceAccountKeyFile override targeting the SAME targetSA must NOT reuse imp-token-1 or interactive SessionID!
+		saOverrideSettings := map[string]json.RawMessage{
+			"serviceAccountKeyFile":     json.RawMessage(fmt.Sprintf("%q", saFile)),
+			"impersonateServiceAccount": json.RawMessage(fmt.Sprintf("%q", targetSA)),
+		}
+		saTok, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:    "https://www.googleapis.com/auth/cloud-platform",
+			Settings: saOverrideSettings,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "imp-token-2", saTok.AccessToken)
+		assert.Equal(t, auth.FlowServicePrincipal, saTok.Flow)
+		assert.Empty(t, saTok.SessionID)
+		assert.Equal(t, int32(2), iamCalls.Load())
+	})
+
+	t.Run("replacement login without refresh_token marks NoRefreshToken so failed legacy DeleteSecret cannot leak old refresh token", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		p, fake, mockHTTP := newTestPlugin(t)
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at",
+			RefreshToken: "alice-legacy-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      makeTestIDToken(map[string]any{"sub": "alice", "email": "alice@example.com"}),
+		})
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken: "bob-no-rt-at",
+			TokenType:   "Bearer",
+			ExpiresIn:   600,
+			IDToken:     makeTestIDToken(map[string]any{"sub": "bob", "email": "bob@example.com"}),
+		})
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			completeLoopbackCallback(t, authURL, "REPL-NO-RT")
+			return nil
+		}
+
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "alice-legacy-rt", fake.secrets[SecretKeyRefreshToken])
+
+		// Fail DeleteSecret on legacy SecretKeyRefreshToken during Bob's refresh-token-less login
+		fake.mu.Lock()
+		fake.deleteSecretFunc = func(_ context.Context, name string) error {
+			if name == SecretKeyRefreshToken {
+				return errors.New("delete failed")
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.NoError(t, err)
+
+		// Even though SecretKeyRefreshToken still holds "alice-legacy-rt", Bob's metadata has
+		// NoRefreshToken: true so forceRefresh must NOT mint with Alice's refresh token!
+		_, hasRT, err := func() (*TokenMetadata, bool, error) {
+			m, _, hr, e := p.inspectStoredMetadataAndRefresh(context.Background())
+			return m, hr, e
+		}()
+		require.NoError(t, err)
+		assert.False(t, hasRT)
+
+		_, err = p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:        "https://www.googleapis.com/auth/cloud-platform",
+			ForceRefresh: true,
+		})
+		require.ErrorIs(t, err, ErrNotAuthenticated)
+	})
+
+	t.Run("two per-RPC externalAccountFile configs sharing an audience do not share cached WIF tokens", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		dir := t.TempDir()
+		sharedAud := "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/shared/providers/p"
+
+		writeWIF := func(prefix, assertion string) string {
+			subj := filepath.Join(dir, prefix+"-token")
+			require.NoError(t, os.WriteFile(subj, []byte(assertion), 0o600))
+			cfgPath := filepath.Join(dir, prefix+"-wif.json")
+			b, _ := json.Marshal(ExternalAccountConfig{
+				Type:             "external_account",
+				Audience:         sharedAud,
+				SubjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
+				CredentialSource: CredentialSource{File: subj},
+			})
+			require.NoError(t, os.WriteFile(cfgPath, b, 0o600))
+			return cfgPath
+		}
+		wifA := writeWIF("a", "assertion-A")
+		wifB := writeWIF("b", "assertion-B")
+
+		p, _, _ := newTestPlugin(t)
+		p.httpClient = &blockingHTTPClient{
+			onPost: func(_ context.Context, _ string, data url.Values) (*http.Response, error) {
+				return jsonHTTPResponse(http.StatusOK, STSTokenResponse{
+					AccessToken: "sts-" + data.Get("subject_token"),
+					TokenType:   "Bearer",
+					ExpiresIn:   3600,
+				}), nil
+			},
+		}
+
+		tokA, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:    "https://www.googleapis.com/auth/cloud-platform",
+			Settings: map[string]json.RawMessage{"externalAccountFile": json.RawMessage(fmt.Sprintf("%q", wifA))},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "sts-assertion-A", tokA.AccessToken)
+
+		tokB, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:    "https://www.googleapis.com/auth/cloud-platform",
+			Settings: map[string]json.RawMessage{"externalAccountFile": json.RawMessage(fmt.Sprintf("%q", wifB))},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "sts-assertion-B", tokB.AccessToken)
+	})
+
+	t.Run("Logout guards sessionless snapshots and metadata reread failures; gcloud_adc and metadata Login propagate persistence failures", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		// 1. Legacy sessionless snapshot replaced during revocation is NOT deleted,
+		// and metadata reread failure after revocation aborts deletion with an error.
+		p, fake, _ := newTestPlugin(t)
+		revokeEntered := make(chan struct{})
+		releaseRevoke := make(chan struct{})
+		p.httpClient = &blockingHTTPClient{
+			onPost: func(_ context.Context, endpoint string, _ url.Values) (*http.Response, error) {
+				if endpoint == revokeEndpoint {
+					select {
+					case <-revokeEntered:
+					default:
+						close(revokeEntered)
+					}
+					<-releaseRevoke
+					return jsonHTTPResponse(http.StatusOK, map[string]string{}), nil
+				}
+				return jsonHTTPResponse(http.StatusOK, TokenResponse{
+					AccessToken:  "repl-at",
+					RefreshToken: "repl-rt",
+					TokenType:    "Bearer",
+					ExpiresIn:    3600,
+					IDToken:      makeTestIDToken(map[string]any{"sub": "repl", "email": "repl@example.com"}),
+				}), nil
+			},
+		}
+
+		// Legacy metadata with NO SessionID
+		fake.secrets[SecretKeyMetadata] = `{"flow":"interactive"}`
+		fake.secrets[SecretKeyRefreshToken] = "legacy-rt"
+
+		logoutDone := make(chan error, 1)
+		go func() {
+			logoutDone <- p.Logout(context.Background(), HandlerName, sdkplugin.LogoutRequest{})
+		}()
+		<-revokeEntered
+
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			completeLoopbackCallback(t, authURL, "REPL-LEGACY")
+			return nil
+		}
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.NoError(t, err)
+		close(releaseRevoke)
+		require.NoError(t, <-logoutDone)
+
+		st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		assert.True(t, st.Authenticated)
+		assert.Equal(t, "repl@example.com", st.Claims.Email)
+
+		// Metadata reread error after revocation aborts deletion
+		var metaReads atomic.Int32
+		fake.mu.Lock()
+		fake.getSecretFunc = func(_ context.Context, name string) error {
+			if name == SecretKeyMetadata && metaReads.Add(1) >= 3 {
+				return errors.New("reread failure")
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+		err = p.Logout(context.Background(), HandlerName, sdkplugin.LogoutRequest{})
+		require.Error(t, err)
+		fake.mu.Lock()
+		fake.getSecretFunc = nil
+		fake.mu.Unlock()
+		assert.NotEmpty(t, fake.secrets[SecretKeyMetadata])
+
+		// 2. gcloud_adc and metadata Login fail when metadata persistence fails
+		dir := t.TempDir()
+		gcloudADCBytes, _ := json.Marshal(map[string]string{
+			"type":          "authorized_user",
+			"client_id":     "gcloud-cid",
+			"client_secret": "gcloud-sec",
+			"refresh_token": "gcloud-rt",
+		})
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "application_default_credentials.json"), gcloudADCBytes, 0o600))
+		t.Setenv(EnvCloudSDKConfig, dir)
+
+		metaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/token") {
+				_ = json.NewEncoder(w).Encode(MetadataTokenResponse{AccessToken: "m-at", TokenType: "Bearer", ExpiresIn: 3600})
+				return
+			}
+			_, _ = w.Write([]byte("meta@proj.iam.gserviceaccount.com"))
+		}))
+		t.Cleanup(metaSrv.Close)
+		t.Setenv(EnvGCEMetadataHost, metaSrv.Listener.Addr().String())
+
+		p.httpClient = &blockingHTTPClient{
+			onPost: func(_ context.Context, endpoint string, _ url.Values) (*http.Response, error) {
+				if endpoint == stsEndpoint {
+					return jsonHTTPResponse(http.StatusOK, STSTokenResponse{
+						AccessToken: "wi-at",
+						TokenType:   "Bearer",
+						ExpiresIn:   3600,
+					}), nil
+				}
+				return jsonHTTPResponse(http.StatusOK, TokenResponse{
+					AccessToken: "flow-at",
+					TokenType:   "Bearer",
+					ExpiresIn:   3600,
+				}), nil
+			},
+		}
+
+		fake.mu.Lock()
+		fake.setSecretKeyErr = map[string]error{SecretKeyMetadata: errors.New("disk full")}
+		fake.mu.Unlock()
+
+		_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowGcloudADC}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to store metadata")
+
+		_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowMetadata}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to store metadata")
+
+		// service_principal and workload_identity Login also propagate metadata persistence failures
+		saPath := filepath.Join(dir, "sa-persist.json")
+		saBytes, _ := json.Marshal(ServiceAccountKey{
+			Type:         "service_account",
+			ProjectID:    "proj",
+			PrivateKeyID: "kid",
+			PrivateKey:   generateTestRSAKey(t),
+			ClientEmail:  "sa-persist@proj.iam.gserviceaccount.com",
+			ClientID:     "cid",
+		})
+		require.NoError(t, os.WriteFile(saPath, saBytes, 0o600))
+		subjPath := filepath.Join(dir, "wif-subj")
+		require.NoError(t, os.WriteFile(subjPath, []byte("subj-jwt"), 0o600))
+		wifPath := filepath.Join(dir, "wif-persist.json")
+		wifBytes, _ := json.Marshal(ExternalAccountConfig{
+			Type:             "external_account",
+			Audience:         "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/pr",
+			SubjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
+			CredentialSource: CredentialSource{File: subjPath},
+		})
+		require.NoError(t, os.WriteFile(wifPath, wifBytes, 0o600))
+
+		saCtx := sdkplugin.WithRequestSettings(context.Background(), map[string]json.RawMessage{
+			"serviceAccountKeyFile": json.RawMessage(fmt.Sprintf("%q", saPath)),
+		})
+		_, err = p.Login(saCtx, HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowServicePrincipal}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to store metadata")
+
+		wifCtx := sdkplugin.WithRequestSettings(context.Background(), map[string]json.RawMessage{
+			"externalAccountFile": json.RawMessage(fmt.Sprintf("%q", wifPath)),
+		})
+		_, err = p.Login(wifCtx, HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowWorkloadIdentity}, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to store metadata")
+	})
+
+	t.Run("rejects malformed JWS headers, alg none, 5-part JWE, and invalid gcloud_adc ID tokens; PurgeExpiredTokens holds exclusive profileLock", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		noneHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+		validPayload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"iss":"https://accounts.google.com","aud":%q,"sub":"u1","exp":%d}`, DefaultADCClientID, time.Now().Add(time.Hour).Unix())))
+		_, err := validateAndExtractIDTokenClaims(noneHeader+"."+validPayload+".sig", DefaultADCClientID, time.Now())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported alg")
+
+		rsHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+		_, err = validateAndExtractIDTokenClaims(rsHeader+"."+validPayload+".", DefaultADCClientID, time.Now())
+		require.Error(t, err)
+		_, err = validateAndExtractIDTokenClaims(rsHeader+"."+validPayload+".c.d.e", DefaultADCClientID, time.Now())
+		require.Error(t, err)
+
+		// gcloudADCLogin rejects invalid IDToken in token response
+		dir := t.TempDir()
+		gcloudADCBytes, _ := json.Marshal(map[string]string{
+			"type":          "authorized_user",
+			"client_id":     "gcloud-cid",
+			"client_secret": "gcloud-sec",
+			"refresh_token": "gcloud-rt",
+		})
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "application_default_credentials.json"), gcloudADCBytes, 0o600))
+		t.Setenv(EnvCloudSDKConfig, dir)
+
+		p, fake, mockHTTP := newTestPlugin(t)
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken: "gcloud-at",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+			IDToken:     makeTestIDToken(map[string]any{"iss": "https://wrong.issuer", "aud": "gcloud-cid", "sub": "u1"}),
+		})
+		_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowGcloudADC}, nil)
+		require.Error(t, err)
+		assert.Empty(t, fake.secrets)
+
+		// PurgeExpiredTokens holds exclusive profileLock so a concurrent cacheTokenForSession
+		// cannot race between PurgeExpiredTokens's GetSecret and DeleteSecret.
+		cacheKey := buildCacheKey(auth.FlowServicePrincipal, fingerprintHash("sa@proj.iam.gserviceaccount.com"), "cloud-platform")
+		fullKey := SecretKeyTokenPrefix + cacheKey
+		require.NoError(t, cacheSetWithPrefix(context.Background(), p.hostClient(context.Background()), SecretKeyTokenPrefix, cacheKey, &auth.Token{
+			AccessToken: "expired-at",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(-time.Minute),
+			Scope:       "cloud-platform",
+			Flow:        auth.FlowServicePrincipal,
+		}))
+
+		purgeEntered := make(chan struct{})
+		releasePurge := make(chan struct{})
+		fake.mu.Lock()
+		fake.getSecretFunc = func(_ context.Context, name string) error {
+			if name == fullKey {
+				select {
+				case <-purgeEntered:
+				default:
+					close(purgeEntered)
+					<-releasePurge
+				}
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		purgeDone := make(chan error, 1)
+		go func() {
+			_, pErr := p.PurgeExpiredTokens(context.Background(), HandlerName)
+			purgeDone <- pErr
+		}()
+
+		<-purgeEntered
+
+		writeDone := make(chan struct{})
+		go func() {
+			p.cacheTokenForSession(context.Background(), cacheKey, &auth.Token{
+				AccessToken: "fresh-at",
+				TokenType:   "Bearer",
+				ExpiresAt:   time.Now().Add(time.Hour),
+				Scope:       "cloud-platform",
+				Flow:        auth.FlowServicePrincipal,
+			})
+			close(writeDone)
+		}()
+
+		// Because PurgeExpiredTokens holds mu.Lock(), cacheTokenForSession (mu.RLock())
+		// must wait until PurgeExpiredTokens finishes deleting the expired entry!
+		select {
+		case <-writeDone:
+			t.Fatal("cacheTokenForSession must block while PurgeExpiredTokens holds profile write lock")
+		case <-time.After(30 * time.Millisecond):
+		}
+
+		close(releasePurge)
+		require.NoError(t, <-purgeDone)
+		<-writeDone
+
+		fake.mu.Lock()
+		fake.getSecretFunc = nil
+		fake.mu.Unlock()
+
+		surviving, err := cacheGetWithPrefix(context.Background(), p.hostClient(context.Background()), SecretKeyTokenPrefix, cacheKey)
+		require.NoError(t, err)
+		require.NotNil(t, surviving)
+		assert.Equal(t, "fresh-at", surviving.AccessToken)
 	})
 }

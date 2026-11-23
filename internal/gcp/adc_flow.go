@@ -245,7 +245,7 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 	// malformed ID token serves FailureHTML without leaving partial state.
 	var claims *auth.Claims
 	if tokenResp.IDToken != "" {
-		claims, err = extractClaimsFromIDToken(tokenResp.IDToken)
+		claims, err = validateAndExtractIDTokenClaims(tokenResp.IDToken, clientID, time.Now())
 		if err != nil {
 			settleCallback(false)
 			return nil, fmt.Errorf("failed to extract claims from ID token: %w", err)
@@ -351,7 +351,7 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 
 		bin := p.binaryName()
 		if errResp.Error == "invalid_grant" {
-			p.logoutIfSessionMatches(ctx, metadata.SessionID)
+			p.logoutIfRefreshRevisionMatches(ctx, metadata.SessionID, metadata.RefreshTokenID, metadata.RefreshTokenHash, refreshToken)
 			return nil, fmt.Errorf(
 				"GCP credentials have expired or been revoked (%s). "+
 					"Run: %s auth login %s: %w",
@@ -370,10 +370,10 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 		return nil, fmt.Errorf("token refresh failed: token endpoint returned empty access_token")
 	}
 
-	// Handle refresh token rotation unless a concurrent login replaced the session
+	// Handle refresh token rotation unless a concurrent login or refresh replaced the revision
 	if tokenResp.RefreshToken != "" && tokenResp.RefreshToken != refreshToken {
 		lgr.V(1).Info("refresh token rotated, storing new token")
-		if storeErr := p.storeRotatedCredentials(ctx, cfg, &tokenResp, metadata, clientID); storeErr != nil {
+		if storeErr := p.storeRotatedCredentials(ctx, cfg, &tokenResp, metadata, refreshToken, clientID); storeErr != nil {
 			lgr.V(1).Info("warning: failed to update refresh token", "error", storeErr)
 		}
 	}
@@ -438,6 +438,9 @@ func (p *Plugin) getStoredRefreshTokenWithMinValidFor(ctx context.Context, scope
 			cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
 			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) {
 				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
+					if cached.Flow == "" {
+						cached.Flow = userFlow
+					}
 					lgr.V(1).Info("using cached token", "scope", scope)
 					return cached, nil
 				}

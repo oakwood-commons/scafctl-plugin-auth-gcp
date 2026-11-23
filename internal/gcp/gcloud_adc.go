@@ -192,19 +192,29 @@ func (p *Plugin) gcloudADCLogin(ctx context.Context, _ sdkplugin.LoginRequest) (
 		return nil, fmt.Errorf("gcloud ADC token refresh failed: token endpoint returned empty access_token")
 	}
 
-	// Extract claims from ID token or userinfo
+	// Validate ID token when present, falling back to userinfo when IDToken is
+	// absent or omits email.
 	var claims *auth.Claims
-	claims, err = extractClaims(&tokenResp)
-	if err != nil || claims.Email == "" {
-		claims, err = p.fetchUserinfoClaimsWithClient(ctx, httpClient, tokenResp.AccessToken)
+	if tokenResp.IDToken != "" {
+		claims, err = validateAndExtractIDTokenClaims(tokenResp.IDToken, creds.ClientID, time.Now())
 		if err != nil {
+			return nil, fmt.Errorf("failed to extract claims from ID token: %w", err)
+		}
+	}
+	if claims == nil || claims.Email == "" {
+		fetchedClaims, fetchErr := p.fetchUserinfoClaimsWithClient(ctx, httpClient, tokenResp.AccessToken)
+		if fetchErr != nil {
 			if ctx.Err() != nil {
 				if ctx.Err() == context.DeadlineExceeded {
 					return nil, fmt.Errorf("authentication timed out: %w", ErrTimeout)
 				}
 				return nil, fmt.Errorf("authentication cancelled: %w", ErrUserCancelled)
 			}
-			claims = &auth.Claims{Issuer: "https://accounts.google.com"}
+			if claims == nil {
+				claims = &auth.Claims{Issuer: "https://accounts.google.com"}
+			}
+		} else {
+			claims = fetchedClaims
 		}
 	}
 
@@ -227,7 +237,7 @@ func (p *Plugin) gcloudADCLogin(ctx context.Context, _ sdkplugin.LoginRequest) (
 	// Store metadata (but NOT the refresh token -- we leave that in gcloud's file)
 	// and atomically seed the cached access token under ctx's profile.
 	if _, err := p.storeMetadataAndSeedToken(ctx, claims, auth.FlowGcloudADC, strings.Fields(scopeStr), cacheKey, initialToken); err != nil {
-		lgr.V(1).Info("warning: failed to store metadata", "error", err)
+		return nil, fmt.Errorf("failed to store metadata: %w", err)
 	}
 
 	lgr.V(1).Info("gcloud ADC fallback login successful", "email", claims.Email)
@@ -266,7 +276,7 @@ func (p *Plugin) getGcloudADCTokenWithMinValidFor(ctx context.Context, scope str
 
 	fingerprint := fingerprintHash(creds.ClientID)
 	prefix := p.tokenCachePrefix(ctx)
-	sessionID := p.readFlowSessionID(ctx, auth.FlowGcloudADC)
+	sessionID := p.readFlowSessionID(ctx, auth.FlowGcloudADC, "")
 	cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprint, scope)
 
 	// Check cache first
@@ -275,6 +285,9 @@ func (p *Plugin) getGcloudADCTokenWithMinValidFor(ctx context.Context, scope str
 			cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
 			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) {
 				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
+					if cached.Flow == "" {
+						cached.Flow = auth.FlowGcloudADC
+					}
 					lgr.V(1).Info("using cached gcloud ADC token", "scope", scope)
 					return cached, nil
 				}

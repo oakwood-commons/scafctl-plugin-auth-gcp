@@ -115,9 +115,15 @@ func (p *Plugin) getExternalAccountConfigForConfig(cfg *Config) (*ExternalAccoun
 	return getExternalAccountConfigFromPath(os.Getenv(EnvGoogleExternalAccount), false)
 }
 
-func (p *Plugin) hasWorkloadIdentityCredentialsForConfig(cfg *Config) bool {
-	_, err := p.getExternalAccountConfigForConfig(cfg)
-	return err == nil
+func workloadIdentityFingerprint(cfg *ExternalAccountConfig) string {
+	if cfg == nil {
+		return fingerprintHash("")
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return fingerprintHash(cfg.Audience + "|" + cfg.CredentialSource.File + "|" + cfg.CredentialSource.URL)
+	}
+	return fingerprintHash(string(data))
 }
 
 // readSubjectToken reads the subject token from the credential source.
@@ -205,9 +211,9 @@ func (p *Plugin) workloadIdentityLogin(ctx context.Context, req sdkplugin.LoginR
 		Subject: extCfg.Audience,
 	}
 
-	cacheKey := buildCacheKey(auth.FlowWorkloadIdentity, fingerprintHash(extCfg.Audience), scope)
+	cacheKey := buildCacheKey(auth.FlowWorkloadIdentity, workloadIdentityFingerprint(extCfg), scope)
 	if _, err := p.storeMetadataAndSeedToken(ctx, claims, auth.FlowWorkloadIdentity, scopes, cacheKey, token); err != nil {
-		lgr.V(1).Info("warning: failed to store metadata", "error", err)
+		return nil, fmt.Errorf("failed to store metadata: %w", err)
 	}
 
 	lgr.V(1).Info("workload identity authentication successful",
@@ -325,9 +331,9 @@ func (p *Plugin) getWorkloadIdentityTokenWithMinValidFor(ctx context.Context, sc
 		return nil, fmt.Errorf("workload identity credentials error: %w", err)
 	}
 
-	fingerprint := fingerprintHash(extCfg.Audience)
+	fingerprint := workloadIdentityFingerprint(extCfg)
 	prefix := p.tokenCachePrefix(ctx)
-	sessionID := p.readFlowSessionID(ctx, auth.FlowWorkloadIdentity)
+	sessionID := p.readFlowSessionID(ctx, auth.FlowWorkloadIdentity, extCfg.Audience)
 	cacheKey := buildCacheKey(auth.FlowWorkloadIdentity, fingerprint, scope)
 
 	// Check cache first
@@ -336,6 +342,9 @@ func (p *Plugin) getWorkloadIdentityTokenWithMinValidFor(ctx context.Context, sc
 			cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
 			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) {
 				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
+					if cached.Flow == "" {
+						cached.Flow = auth.FlowWorkloadIdentity
+					}
 					lgr.V(1).Info("using cached WI token", "scope", scope)
 					return cached, nil
 				}

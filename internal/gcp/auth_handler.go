@@ -405,22 +405,32 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 		return fmt.Errorf("host service not available")
 	}
 
+	metadataKey := p.secretKey(ctx, secretSuffixMetadata)
+	legacyKey := p.secretKey(ctx, secretSuffixRefreshToken)
+
 	mu := p.profileLock(ctx)
 
-	// Snapshot active session ID and refresh token under read lock so network
+	// Snapshot active session state and refresh token under read lock so network
 	// revocation runs unlocked without racing a concurrent replacement Login.
-	var rt string
-	var beforeSessionID string
 	mu.RLock()
-	if meta, inspectedRT, hasRefresh, inspectErr := p.inspectStoredMetadataAndRefreshUnlocked(ctx); inspectErr == nil {
-		beforeSessionID = meta.SessionID
-		if hasRefresh {
+	beforeMetaRaw, beforeHadMeta, beforeMetaErr := hostClient.GetSecret(ctx, metadataKey)
+	if beforeMetaErr != nil {
+		mu.RUnlock()
+		return fmt.Errorf("reading session metadata for logout: %w", beforeMetaErr)
+	}
+	beforeLegacyRT, beforeHadLegacyRT, beforeLegacyErr := hostClient.GetSecret(ctx, legacyKey)
+	if beforeLegacyErr != nil {
+		mu.RUnlock()
+		return fmt.Errorf("reading refresh token for logout: %w", beforeLegacyErr)
+	}
+
+	var rt string
+	if beforeHadMeta {
+		if _, inspectedRT, hasRefresh, inspectErr := p.inspectStoredMetadataAndRefreshUnlocked(ctx); inspectErr == nil && hasRefresh {
 			rt = inspectedRT
 		}
-	} else if errors.Is(inspectErr, errMetadataNotFound) {
-		if legacyRT, legacyFound, legacyErr := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken)); legacyErr == nil && legacyFound {
-			rt = legacyRT
-		}
+	} else if beforeHadLegacyRT {
+		rt = beforeLegacyRT
 	}
 	mu.RUnlock()
 
@@ -436,14 +446,37 @@ func (p *Plugin) logoutInternal(ctx context.Context) error {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// If a new Login committed a different non-empty SessionID while revocation
-	// was in flight, do not wipe the replacement session.
-	if beforeSessionID != "" {
-		if metaRaw, found, getErr := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata)); getErr == nil && found && metaRaw != "" {
-			var curMeta TokenMetadata
-			if parseErr := json.Unmarshal([]byte(metaRaw), &curMeta); parseErr == nil && curMeta.SessionID != "" && curMeta.SessionID != beforeSessionID {
+	// Verify stored session state still matches our pre-revocation snapshot;
+	// abort deletion on reread errors or when a replacement Login committed.
+	curMetaRaw, curHadMeta, curMetaErr := hostClient.GetSecret(ctx, metadataKey)
+	if curMetaErr != nil {
+		return fmt.Errorf("verifying session metadata before logout delete: %w", curMetaErr)
+	}
+
+	if !beforeHadMeta {
+		if curHadMeta {
+			return nil
+		}
+		curLegacyRT, curHadLegacyRT, curLegacyErr := hostClient.GetSecret(ctx, legacyKey)
+		if curLegacyErr != nil {
+			return fmt.Errorf("verifying refresh token before logout delete: %w", curLegacyErr)
+		}
+		if (!beforeHadLegacyRT && curHadLegacyRT) || (beforeHadLegacyRT && curHadLegacyRT && curLegacyRT != beforeLegacyRT) {
+			return nil
+		}
+	} else {
+		if !curHadMeta {
+			return nil
+		}
+		var beforeMeta, curMeta TokenMetadata
+		beforeParseErr := json.Unmarshal([]byte(beforeMetaRaw), &beforeMeta)
+		curParseErr := json.Unmarshal([]byte(curMetaRaw), &curMeta)
+		if beforeParseErr == nil && curParseErr == nil && beforeMeta.SessionID != "" {
+			if curMeta.SessionID != beforeMeta.SessionID {
 				return nil
 			}
+		} else if curMetaRaw != beforeMetaRaw {
+			return nil
 		}
 	}
 
@@ -478,6 +511,43 @@ func (p *Plugin) logoutIfSessionMatches(ctx context.Context, expectedSessionID s
 	p.logoutLocked(ctx, hostClient)
 }
 
+// logoutIfRefreshRevisionMatches clears stored credentials on refresh-grant
+// invalidation only when both SessionID and the refresh-token revision/hash
+// (or legacy refresh token) still match the invalidated grant.
+func (p *Plugin) logoutIfRefreshRevisionMatches(ctx context.Context, expectedSessionID, expectedRevID, expectedHash, expectedRefreshToken string) {
+	hostClient := p.hostClient(ctx)
+	if hostClient == nil {
+		return
+	}
+
+	mu := p.profileLock(ctx)
+	mu.Lock()
+	defer mu.Unlock()
+
+	metaRaw, found, err := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixMetadata))
+	if err != nil || !found || metaRaw == "" {
+		return
+	}
+	var curMeta TokenMetadata
+	if parseErr := json.Unmarshal([]byte(metaRaw), &curMeta); parseErr != nil {
+		return
+	}
+	if curMeta.NoRefreshToken ||
+		curMeta.SessionID != expectedSessionID ||
+		curMeta.RefreshTokenID != expectedRevID ||
+		curMeta.RefreshTokenHash != expectedHash {
+		return
+	}
+	if expectedRevID == "" && expectedHash == "" && expectedRefreshToken != "" {
+		legacyRT, legacyFound, legacyErr := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken))
+		if legacyErr != nil || !legacyFound || legacyRT != expectedRefreshToken {
+			return
+		}
+	}
+
+	p.logoutLocked(ctx, hostClient)
+}
+
 func (p *Plugin) logoutLocked(ctx context.Context, hostClient *sdkplugin.HostServiceClient) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
@@ -497,7 +567,9 @@ func (p *Plugin) logoutLocked(ctx context.Context, hostClient *sdkplugin.HostSer
 	}
 }
 
-// GetStatus returns the current authentication status without mutating stored state.
+// GetStatus returns the current authentication status without deleting
+// credentials or populating the access-token cache; if Google rotates the
+// refresh grant during validation, the replacement refresh token is persisted.
 func (p *Plugin) GetStatus(ctx context.Context, handlerName string, req sdkplugin.StatusRequest) (*auth.Status, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
@@ -616,8 +688,9 @@ func (p *Plugin) GetStatus(ctx context.Context, handlerName string, req sdkplugi
 		status.ClientID = metadata.ImpersonateServiceAccount
 	}
 
-	// Validate refresh-token-backed user sessions read-only (checking cache first,
-	// then probing tokenEndpoint without persisting or wiping credentials).
+	// Validate refresh-token-backed user sessions (checking cache first, then
+	// probing tokenEndpoint without deleting credentials or caching access tokens;
+	// any rotated refresh token is persisted so the session stays valid).
 	if hasRefresh {
 		if tokenErr := p.validateStoredRefreshToken(ctx, cfg, metadata, refreshToken); tokenErr != nil {
 			status.Authenticated = false
@@ -735,19 +808,25 @@ func (p *Plugin) acquireSourceTokenWithMinValidFor(ctx context.Context, scope st
 		return nil, fmt.Errorf("service account credentials error: %w", saErr)
 	}
 
-	// 3. Stored profile session (metadata, gcloud_adc, interactive, device_code)
-	metadata, _, hasRefresh, credErr := p.inspectStoredMetadataAndRefresh(ctx)
-	if credErr == nil && metadata != nil {
-		switch {
-		case metadata.Flow == auth.FlowMetadata:
-			return p.getMetadataTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
-		case metadata.Flow == auth.FlowGcloudADC:
-			return p.getGcloudADCTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
-		case hasRefresh || metadata.Flow == auth.FlowInteractive || metadata.Flow == auth.FlowDeviceCode:
-			return p.getStoredRefreshTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+	// 3. Stored profile session (metadata, gcloud_adc, interactive, device_code).
+	// When a host secret store is available, only fall through to ambient
+	// GCE/gcloud credentials after confirming stored metadata is absent.
+	if p.hostClient(ctx) != nil {
+		metadata, _, hasRefresh, credErr := p.inspectStoredMetadataAndRefresh(ctx)
+		if credErr == nil && metadata != nil {
+			switch {
+			case metadata.Flow == auth.FlowMetadata:
+				return p.getMetadataTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+			case metadata.Flow == auth.FlowGcloudADC:
+				return p.getGcloudADCTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+			case hasRefresh || metadata.Flow == auth.FlowInteractive || metadata.Flow == auth.FlowDeviceCode:
+				return p.getStoredRefreshTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+			default:
+				return nil, ErrNotAuthenticated
+			}
+		} else if credErr != nil && !errors.Is(credErr, errMetadataNotFound) {
+			return nil, fmt.Errorf("%w: %w", ErrNotAuthenticated, credErr)
 		}
-	} else if errors.Is(credErr, errInconsistentSession) {
-		return nil, fmt.Errorf("%w: %w", ErrNotAuthenticated, credErr)
 	}
 
 	// 4. Ambient GCE/GKE metadata server
@@ -774,10 +853,14 @@ func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*a
 		return nil, fmt.Errorf("host service not available")
 	}
 
+	mu := p.profileLock(ctx)
+	mu.RLock()
+	defer mu.RUnlock()
+
 	var results []*auth.CachedTokenInfo
 
 	// Refresh token (ADC browser / device code flow)
-	if hasRefresh, metadata := p.loadRefreshTokenStatus(ctx); hasRefresh {
+	if metadata, _, hasRefresh, inspectErr := p.inspectStoredMetadataAndRefreshUnlocked(ctx); inspectErr == nil && hasRefresh {
 		info := &auth.CachedTokenInfo{
 			Handler:   HandlerName,
 			TokenKind: "refresh",
@@ -803,7 +886,8 @@ func (p *Plugin) ListCachedTokens(ctx context.Context, handlerName string) ([]*a
 	return results, nil
 }
 
-// PurgeExpiredTokens removes expired tokens from ctx's profile cache.
+// PurgeExpiredTokens removes expired tokens from ctx's profile cache under the
+// profile write lock so read/delete cannot race with concurrent token writes.
 func (p *Plugin) PurgeExpiredTokens(ctx context.Context, handlerName string) (int, error) {
 	if handlerName != HandlerName {
 		return 0, fmt.Errorf("unknown handler: %s", handlerName)
@@ -814,11 +898,17 @@ func (p *Plugin) PurgeExpiredTokens(ctx context.Context, handlerName string) (in
 		return 0, fmt.Errorf("host service not available")
 	}
 
+	mu := p.profileLock(ctx)
+	mu.Lock()
+	defer mu.Unlock()
+
 	return cachePurgeExpiredWithPrefix(ctx, hostClient, p.tokenCachePrefix(ctx))
 }
 
 // DetectAvailableFlows reports which flows have pre-existing environment or configured credentials,
 // ordered to match Login / GetStatus / GetToken auto-detection precedence.
+// Authoritative errors on explicitly configured credential files are returned directly so the
+// host fails closed rather than auto-selecting a lower-priority ambient flow.
 func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) ([]sdkplugin.FlowAvailability, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
@@ -833,7 +923,7 @@ func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) (
 	var flows []sdkplugin.FlowAvailability
 
 	// 1. Workload identity
-	if p.hasWorkloadIdentityCredentialsForConfig(cfg) {
+	if _, wiErr := p.getExternalAccountConfigForConfig(cfg); wiErr == nil {
 		reason := "GOOGLE_EXTERNAL_ACCOUNT is set"
 		if cfg.profileOrEnv(cfg.ExternalAccountFile, "externalAccountFile", "") != "" {
 			reason = "externalAccountFile is configured"
@@ -843,10 +933,12 @@ func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) (
 			Available: true,
 			Reason:    reason,
 		})
+	} else if !errors.Is(wiErr, ErrNoWorkloadIdentityConfigured) {
+		return nil, fmt.Errorf("workload identity credentials error: %w", wiErr)
 	}
 
 	// 2. Service account
-	if p.hasServiceAccountCredentialsForConfig(cfg) {
+	if _, saErr := p.getServiceAccountKeyForConfig(cfg); saErr == nil {
 		reason := "GOOGLE_APPLICATION_CREDENTIALS is set with service_account type"
 		if cfg.profileOrEnv(cfg.ServiceAccountKeyFile, "serviceAccountKeyFile", "") != "" {
 			reason = "serviceAccountKeyFile is configured with service_account type"
@@ -856,6 +948,8 @@ func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) (
 			Available: true,
 			Reason:    reason,
 		})
+	} else if !errors.Is(saErr, ErrNoServiceAccountConfigured) {
+		return nil, fmt.Errorf("service account credentials error: %w", saErr)
 	}
 
 	// 3. Metadata server -- short timeout probe
@@ -958,7 +1052,9 @@ func (p *Plugin) tokenCachePrefix(ctx context.Context) string {
 }
 
 // validateStoredRefreshToken checks whether a stored refresh-token session is
-// valid without mutating stored credentials or cached tokens.
+// valid without deleting credentials or populating the access-token cache,
+// while safely persisting any rotated refresh token returned by Google so a
+// one-time refresh grant is never lost.
 func (p *Plugin) validateStoredRefreshToken(ctx context.Context, cfg *Config, metadata *TokenMetadata, refreshToken string) error {
 	storedClientID := metadata.ClientID
 	if storedClientID == "" {
@@ -969,7 +1065,7 @@ func (p *Plugin) validateStoredRefreshToken(ctx context.Context, cfg *Config, me
 		cacheKey := buildCacheKey(metadata.Flow, fingerprintHash(storedClientID), "")
 		cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, p.tokenCachePrefix(ctx), cacheKey)
 		if cacheErr == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
-			if cached.SessionID == "" || metadata.SessionID == "" || cached.SessionID == metadata.SessionID {
+			if cached.SessionID == "" || cached.SessionID == metadata.SessionID {
 				return nil
 			}
 		}
@@ -1016,6 +1112,11 @@ func (p *Plugin) validateStoredRefreshToken(ctx context.Context, cfg *Config, me
 	}
 	if tokenResp.AccessToken == "" {
 		return fmt.Errorf("token refresh returned empty access_token")
+	}
+	if tokenResp.RefreshToken != "" && tokenResp.RefreshToken != refreshToken {
+		if storeErr := p.storeRotatedCredentials(ctx, cfg, &tokenResp, metadata, refreshToken, storedClientID); storeErr != nil {
+			return fmt.Errorf("persisting rotated refresh token: %w", storeErr)
+		}
 	}
 	return nil
 }

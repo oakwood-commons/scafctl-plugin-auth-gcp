@@ -160,7 +160,7 @@ func (p *Plugin) metadataLogin(ctx context.Context, req sdkplugin.LoginRequest) 
 	scopeStr := strings.Join(effectiveScopes, " ")
 	cacheKey := buildCacheKey(auth.FlowMetadata, fingerprintHash(""), scopeStr)
 	if _, err := p.storeMetadataAndSeedToken(ctx, claims, auth.FlowMetadata, effectiveScopes, cacheKey, token); err != nil {
-		lgr.V(1).Info("warning: failed to store metadata", "error", err)
+		return nil, fmt.Errorf("failed to store metadata: %w", err)
 	}
 
 	lgr.V(1).Info("metadata server authentication successful", "email", email)
@@ -260,7 +260,7 @@ func (p *Plugin) getMetadataTokenWithMinValidFor(ctx context.Context, scope stri
 	}
 
 	prefix := p.tokenCachePrefix(ctx)
-	sessionID := p.readFlowSessionID(ctx, auth.FlowMetadata)
+	sessionID := p.readFlowSessionID(ctx, auth.FlowMetadata, "")
 	cacheKey := buildCacheKey(auth.FlowMetadata, fingerprintHash(""), scope)
 
 	// Check cache first
@@ -269,6 +269,9 @@ func (p *Plugin) getMetadataTokenWithMinValidFor(ctx context.Context, scope stri
 			cached, err := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
 			if err == nil && cached != nil && cached.IsValidFor(minValidFor) {
 				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
+					if cached.Flow == "" {
+						cached.Flow = auth.FlowMetadata
+					}
 					lgr.V(1).Info("using cached metadata token", "scope", scope)
 					return cached, nil
 				}

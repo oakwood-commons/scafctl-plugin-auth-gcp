@@ -1488,7 +1488,7 @@ func TestGetWorkloadIdentityToken_Cached(t *testing.T) {
 	t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", configFile)
 
 	scope := "cloud-platform"
-	fingerprint := fingerprintHash("aud://test")
+	fingerprint := workloadIdentityFingerprint(&cfg)
 	cacheKey := buildCacheKey(auth.FlowWorkloadIdentity, fingerprint, scope)
 	entry := tokenCacheEntry{
 		AccessToken: "cached-wi-token",

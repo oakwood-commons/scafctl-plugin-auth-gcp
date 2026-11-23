@@ -114,7 +114,7 @@ func (p *Plugin) deviceCodeLogin(ctx context.Context, req sdkplugin.LoginRequest
 	// Step 4: Validate and extract claims before mutating stored credentials
 	var claims *auth.Claims
 	if tokenResp.IDToken != "" {
-		claims, err = extractClaimsFromIDToken(tokenResp.IDToken)
+		claims, err = validateAndExtractIDTokenClaims(tokenResp.IDToken, clientID, time.Now())
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract claims from ID token: %w", err)
 		}

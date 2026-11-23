@@ -45,6 +45,7 @@ type TokenMetadata struct {
 	SessionID                 string       `json:"sessionId,omitempty"`
 	RefreshTokenID            string       `json:"refreshTokenId,omitempty"`
 	RefreshTokenHash          string       `json:"refreshTokenSha256,omitempty"`
+	NoRefreshToken            bool         `json:"noRefreshToken,omitempty"`
 }
 
 // TokenResponse represents the response from GCP token endpoints.
@@ -145,9 +146,10 @@ func (p *Plugin) storeCredentialsAndSeedToken(ctx context.Context, cfg *Config, 
 }
 
 // storeRotatedCredentials updates stored credentials for a refresh-token
-// rotation only if expectedMeta.SessionID is still the active session,
-// preserving the session's Project and ImpersonateServiceAccount fields.
-func (p *Plugin) storeRotatedCredentials(ctx context.Context, cfg *Config, tokenResp *TokenResponse, expectedMeta *TokenMetadata, clientID string) error {
+// rotation only if expectedMeta.SessionID and its refresh-token revision/hash
+// (or legacy stored refresh token) still match the active session, preserving
+// the session's Project and ImpersonateServiceAccount fields.
+func (p *Plugin) storeRotatedCredentials(ctx context.Context, cfg *Config, tokenResp *TokenResponse, expectedMeta *TokenMetadata, expectedRefreshToken string, clientID string) error {
 	hostClient := p.hostClient(ctx)
 	if hostClient == nil {
 		return fmt.Errorf("host service not available")
@@ -165,8 +167,20 @@ func (p *Plugin) storeRotatedCredentials(ctx context.Context, cfg *Config, token
 		return nil
 	}
 	var curMeta TokenMetadata
-	if parseErr := json.Unmarshal([]byte(curMetaRaw), &curMeta); parseErr != nil || curMeta.SessionID != expectedMeta.SessionID {
+	if parseErr := json.Unmarshal([]byte(curMetaRaw), &curMeta); parseErr != nil {
 		return nil
+	}
+	if curMeta.SessionID != expectedMeta.SessionID ||
+		curMeta.RefreshTokenID != expectedMeta.RefreshTokenID ||
+		curMeta.RefreshTokenHash != expectedMeta.RefreshTokenHash ||
+		curMeta.NoRefreshToken != expectedMeta.NoRefreshToken {
+		return nil
+	}
+	if expectedMeta.RefreshTokenID == "" && expectedMeta.RefreshTokenHash == "" && expectedRefreshToken != "" {
+		legacyRT, legacyFound, legacyErr := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken))
+		if legacyErr != nil || !legacyFound || legacyRT != expectedRefreshToken {
+			return nil
+		}
 	}
 
 	preservedCfg := DefaultConfig()
@@ -221,6 +235,8 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, cfg *Config, tokenR
 		metadata.RefreshTokenExpiresAt = time.Now().Add(180 * 24 * time.Hour)
 		metadata.RefreshTokenID = revID
 		metadata.RefreshTokenHash = fingerprintHash(tokenResp.RefreshToken)
+	} else {
+		metadata.NoRefreshToken = true
 	}
 
 	metadataBytes, err := json.Marshal(metadata)
@@ -335,6 +351,7 @@ func (p *Plugin) storeMetadataWithInitialToken(ctx context.Context, claims *auth
 		ImpersonateServiceAccount: cfg.ImpersonateServiceAccount,
 		Scopes:                    scopes,
 		SessionID:                 sessionID,
+		NoRefreshToken:            true,
 	}
 
 	metadataBytes, err := json.Marshal(metadata)
@@ -405,7 +422,7 @@ func (p *Plugin) inspectStoredMetadataAndRefreshUnlocked(ctx context.Context) (*
 		return nil, "", false, fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 
-	if !isRefreshTokenFlow(metadata.Flow) {
+	if !isRefreshTokenFlow(metadata.Flow) || metadata.NoRefreshToken {
 		return &metadata, "", false, nil
 	}
 
@@ -461,23 +478,28 @@ func (p *Plugin) loadSessionCredentials(ctx context.Context) (string, *TokenMeta
 	return refreshToken, metadata, nil
 }
 
-func (p *Plugin) loadRefreshTokenStatus(ctx context.Context) (bool, *TokenMetadata) {
-	mu := p.profileLock(ctx)
-	mu.RLock()
-	defer mu.RUnlock()
-
-	if metadata, _, hasRefresh, err := p.inspectStoredMetadataAndRefreshUnlocked(ctx); err == nil && hasRefresh {
-		return true, metadata
-	}
-	return false, nil
-}
-
 // readFlowSessionID returns the stored SessionID when the profile's stored
-// metadata matches expectedFlow, or "" otherwise.
-func (p *Plugin) readFlowSessionID(ctx context.Context, expectedFlow auth.Flow) string {
+// metadata matches expectedFlow and (when expectedPrincipal is non-empty)
+// matches the stored principal claim, or "" otherwise.
+func (p *Plugin) readFlowSessionID(ctx context.Context, expectedFlow auth.Flow, expectedPrincipal string) string {
 	metadata, err := p.loadMetadata(ctx)
 	if err != nil || metadata == nil || metadata.Flow != expectedFlow {
 		return ""
+	}
+	if expectedPrincipal != "" {
+		if metadata.Claims == nil {
+			return ""
+		}
+		switch expectedFlow { //nolint:exhaustive // only principal-bound non-interactive flows pass expectedPrincipal
+		case auth.FlowServicePrincipal:
+			if metadata.Claims.Email != expectedPrincipal && metadata.Claims.Subject != expectedPrincipal {
+				return ""
+			}
+		case auth.FlowWorkloadIdentity:
+			if metadata.Claims.Subject != expectedPrincipal {
+				return ""
+			}
+		}
 	}
 	return metadata.SessionID
 }
@@ -638,6 +660,105 @@ func extractClaimsFromIDToken(idToken string) (*auth.Claims, error) {
 		Name:     idTokenClaims.Name,
 		Username: username,
 		IssuedAt: time.Unix(idTokenClaims.IssuedAt, 0),
+	}, nil
+}
+
+const idTokenClockSkewLeeway = 30 * time.Second
+
+type jwtAudience []string
+
+func (a *jwtAudience) UnmarshalJSON(data []byte) error {
+	var single string
+	if err := json.Unmarshal(data, &single); err == nil {
+		*a = []string{single}
+		return nil
+	}
+	var list []string
+	if err := json.Unmarshal(data, &list); err == nil {
+		*a = list
+		return nil
+	}
+	return fmt.Errorf("invalid aud claim format")
+}
+
+// validateAndExtractIDTokenClaims decodes and validates an OIDC ID token
+// returned directly over TLS from Google's token endpoint against JWS
+// structure, Google's issuer, the effective OAuth client ID audience (and azp
+// when present), non-empty subject, and token lifetime before credentials are
+// committed.
+func validateAndExtractIDTokenClaims(idToken, expectedClientID string, now time.Time) (*auth.Claims, error) {
+	parts := strings.Split(idToken, ".")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return nil, fmt.Errorf("invalid ID token format")
+	}
+
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode ID token header: %w", err)
+	}
+	var rawHeader struct {
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(headerBytes, &rawHeader); err != nil {
+		return nil, fmt.Errorf("failed to parse ID token header: %w", err)
+	}
+	if strings.TrimSpace(rawHeader.Alg) == "" || strings.EqualFold(strings.TrimSpace(rawHeader.Alg), "none") {
+		return nil, fmt.Errorf("invalid ID token: unsupported alg %q", sanitizeControlChars(rawHeader.Alg))
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode ID token payload: %w", err)
+	}
+
+	var rawClaims struct {
+		Issuer          string      `json:"iss"`
+		Subject         string      `json:"sub"`
+		Audience        jwtAudience `json:"aud"`
+		AuthorizedParty string      `json:"azp"`
+		Email           string      `json:"email"`
+		Name            string      `json:"name"`
+		IssuedAt        int64       `json:"iat"`
+		ExpiresAt       int64       `json:"exp"`
+		NotBefore       int64       `json:"nbf"`
+	}
+	if err := json.Unmarshal(payload, &rawClaims); err != nil {
+		return nil, fmt.Errorf("failed to parse ID token claims: %w", err)
+	}
+
+	if rawClaims.Issuer != "https://accounts.google.com" && rawClaims.Issuer != "accounts.google.com" {
+		return nil, fmt.Errorf("invalid ID token issuer %q", sanitizeControlChars(rawClaims.Issuer))
+	}
+	if strings.TrimSpace(rawClaims.Subject) == "" {
+		return nil, fmt.Errorf("invalid ID token: missing sub claim")
+	}
+	if expectedClientID == "" || !slices.Contains([]string(rawClaims.Audience), expectedClientID) {
+		return nil, fmt.Errorf("invalid ID token: aud claim does not match client ID")
+	}
+	if rawClaims.AuthorizedParty != "" && rawClaims.AuthorizedParty != expectedClientID {
+		return nil, fmt.Errorf("invalid ID token: azp claim does not match client ID")
+	}
+	if rawClaims.ExpiresAt <= 0 || !time.Unix(rawClaims.ExpiresAt, 0).Add(idTokenClockSkewLeeway).After(now) {
+		return nil, fmt.Errorf("invalid ID token: token is expired or missing exp claim")
+	}
+	if rawClaims.NotBefore > 0 && now.Add(idTokenClockSkewLeeway).Before(time.Unix(rawClaims.NotBefore, 0)) {
+		return nil, fmt.Errorf("invalid ID token: token is not yet valid (nbf)")
+	}
+
+	username := ""
+	if rawClaims.Email != "" {
+		if idx := strings.Index(rawClaims.Email, "@"); idx > 0 {
+			username = rawClaims.Email[:idx]
+		}
+	}
+
+	return &auth.Claims{
+		Issuer:   rawClaims.Issuer,
+		Subject:  rawClaims.Subject,
+		Email:    rawClaims.Email,
+		Name:     rawClaims.Name,
+		Username: username,
+		IssuedAt: time.Unix(rawClaims.IssuedAt, 0),
 	}, nil
 }
 
