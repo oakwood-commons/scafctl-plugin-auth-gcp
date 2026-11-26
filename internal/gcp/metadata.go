@@ -126,7 +126,7 @@ func (p *Plugin) isMetadataServerAvailable(ctx context.Context) bool {
 		return false
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return resp.StatusCode == 200
+	return resp.StatusCode == http.StatusOK
 }
 
 // metadataLogin validates metadata server access by acquiring a token.
@@ -157,9 +157,10 @@ func (p *Plugin) metadataLogin(ctx context.Context, req sdkplugin.LoginRequest) 
 		effectiveScopes = []string{"https://www.googleapis.com/auth/cloud-platform"}
 	}
 
-	// Store metadata
-	if err := p.storeMetadataOnly(ctx, claims, auth.FlowMetadata, effectiveScopes); err != nil {
-		lgr.V(1).Info("warning: failed to store metadata", "error", err)
+	scopeStr := strings.Join(effectiveScopes, " ")
+	cacheKey := buildCacheKey(auth.FlowMetadata, fingerprintHash(""), scopeStr)
+	if _, err := p.storeMetadataAndSeedToken(ctx, claims, auth.FlowMetadata, effectiveScopes, cacheKey, token); err != nil {
+		return nil, fmt.Errorf("failed to store metadata: %w", err)
 	}
 
 	lgr.V(1).Info("metadata server authentication successful", "email", email)
@@ -192,13 +193,16 @@ func (p *Plugin) fetchMetadataToken(ctx context.Context, scope string) (*auth.To
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("metadata server not available: not running on Google Cloud? (status %d)", resp.StatusCode)
 	}
 
 	var tokenResp MetadataTokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse metadata token response: %w", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("metadata server token response returned empty access_token")
 	}
 
 	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
@@ -231,7 +235,7 @@ func (p *Plugin) fetchMetadataEmail(ctx context.Context) (string, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("metadata email request failed with status %d", resp.StatusCode)
 	}
 
@@ -245,17 +249,32 @@ func (p *Plugin) fetchMetadataEmail(ctx context.Context) (string, error) {
 
 // getMetadataToken gets a token from metadata server, with caching.
 func (p *Plugin) getMetadataToken(ctx context.Context, scope string, forceRefresh bool) (*auth.Token, error) {
+	return p.getMetadataTokenWithMinValidFor(ctx, scope, forceRefresh, DefaultMinValidFor)
+}
+
+func (p *Plugin) getMetadataTokenWithMinValidFor(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
+
+	if minValidFor <= 0 {
+		minValidFor = DefaultMinValidFor
+	}
+
+	prefix := p.tokenCachePrefix(ctx)
+	sessionID := p.readFlowSessionID(ctx, auth.FlowMetadata, "")
+	cacheKey := buildCacheKey(auth.FlowMetadata, fingerprintHash(""), scope)
 
 	// Check cache first
 	if !forceRefresh {
-		hostClient := p.hostClient(ctx)
-		if hostClient != nil {
-			cacheKey := buildCacheKey(auth.FlowMetadata, fingerprintHash(""), scope)
-			cached, err := cacheGet(ctx, hostClient, cacheKey)
-			if err == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
-				lgr.V(1).Info("using cached metadata token", "scope", scope)
-				return cached, nil
+		if hostClient := p.hostClient(ctx); hostClient != nil {
+			cached, err := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
+			if err == nil && cached != nil && cached.IsValidFor(minValidFor) {
+				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
+					if cached.Flow == "" {
+						cached.Flow = auth.FlowMetadata
+					}
+					lgr.V(1).Info("using cached metadata token", "scope", scope)
+					return cached, nil
+				}
 			}
 		}
 	}
@@ -265,15 +284,10 @@ func (p *Plugin) getMetadataToken(ctx context.Context, scope string, forceRefres
 	if err != nil {
 		return nil, err
 	}
+	token.SessionID = sessionID
 
-	// Cache it
-	hostClient := p.hostClient(ctx)
-	if hostClient != nil {
-		cacheKey := buildCacheKey(auth.FlowMetadata, fingerprintHash(""), scope)
-		if cacheSetErr := cacheSet(ctx, hostClient, cacheKey, token); cacheSetErr != nil {
-			lgr.V(1).Info("failed to cache metadata token", "error", cacheSetErr)
-		}
-	}
+	// Cache it if the session is still current
+	p.cacheTokenForSession(ctx, cacheKey, token)
 
 	return token, nil
 }

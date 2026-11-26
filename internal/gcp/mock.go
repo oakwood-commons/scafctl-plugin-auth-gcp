@@ -66,6 +66,24 @@ func (m *MockHTTPClient) AddError(err error) *MockHTTPClient {
 	return m
 }
 
+// GetRequests returns a snapshot of recorded requests safe for concurrent inspection.
+func (m *MockHTTPClient) GetRequests() []*MockRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*MockRequest, len(m.Requests))
+	copy(out, m.Requests)
+	return out
+}
+
+// Reset clears recorded requests and queued responses.
+func (m *MockHTTPClient) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Requests = make([]*MockRequest, 0)
+	m.Responses = make([]*MockResponse, 0)
+	m.callIndex = 0
+}
+
 // nextResponse records the request and returns the next canned response.
 func (m *MockHTTPClient) nextResponse(method, endpoint string, data url.Values, headers map[string]string, body []byte) (*http.Response, error) {
 	m.mu.Lock()

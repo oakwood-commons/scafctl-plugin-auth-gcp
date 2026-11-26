@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -46,8 +48,10 @@ func (e *gcloudADCInvalidCredentialsError) Error() string { return e.msg }
 
 // formatGcloudTokenError converts a raw OAuth error response into a clear, actionable error.
 func formatGcloudTokenError(errResp TokenErrorResponse, binaryName string) error {
-	if errResp.Error == "invalid_grant" {
-		if strings.Contains(errResp.ErrorDescription, "invalid_rapt") {
+	errCode := sanitizeControlChars(errResp.Error)
+	errDesc := sanitizeControlChars(errResp.ErrorDescription)
+	if errCode == "invalid_grant" {
+		if strings.Contains(errDesc, "invalid_rapt") {
 			return &gcloudADCInvalidCredentialsError{msg: fmt.Sprintf(
 				"gcloud ADC credentials require re-authentication (invalid_rapt): "+
 					"a security policy requires you to reauthenticate. "+
@@ -58,11 +62,11 @@ func formatGcloudTokenError(errResp TokenErrorResponse, binaryName string) error
 		return &gcloudADCInvalidCredentialsError{msg: fmt.Sprintf(
 			"gcloud ADC credentials have expired or been revoked (%s). "+
 				"Run: gcloud auth application-default login OR %s auth login %s --flow interactive",
-			errResp.ErrorDescription,
+			errDesc,
 			binaryName, HandlerName,
 		)}
 	}
-	return fmt.Errorf("gcloud ADC token refresh failed: %s - %s", errResp.Error, errResp.ErrorDescription)
+	return fmt.Errorf("gcloud ADC token refresh failed: %s - %s", errCode, errDesc)
 }
 
 // GcloudADCCredentials represents the structure of the gcloud ADC JSON file.
@@ -144,6 +148,15 @@ func (p *Plugin) gcloudADCLogin(ctx context.Context, _ sdkplugin.LoginRequest) (
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("attempting gcloud ADC fallback login")
 
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	creds, err := LoadGcloudADCCredentials()
 	if err != nil {
 		if errors.Is(err, ErrNoGcloudADCConfigured) {
@@ -159,32 +172,49 @@ func (p *Plugin) gcloudADCLogin(ctx context.Context, _ sdkplugin.LoginRequest) (
 	data.Set("client_secret", creds.ClientSecret)
 	data.Set("refresh_token", creds.RefreshToken)
 
-	resp, err := p.httpClient.PostForm(ctx, tokenEndpoint, data)
+	resp, err := httpClient.PostForm(ctx, tokenEndpoint, data)
 	if err != nil {
 		return nil, fmt.Errorf("gcloud ADC token refresh failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		var errResp TokenErrorResponse
-		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		_ = json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&errResp)
 		return nil, formatGcloudTokenError(errResp, p.binaryName())
 	}
 
 	var tokenResp TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
+	if tokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("gcloud ADC token refresh failed: token endpoint returned empty access_token")
+	}
 
-	// Extract claims from ID token or userinfo
+	// Validate ID token when present, falling back to userinfo when IDToken is
+	// absent or omits email.
 	var claims *auth.Claims
-	claims, err = extractClaims(&tokenResp)
-	if err != nil || claims.Email == "" {
-		if tokenResp.AccessToken != "" {
-			claims, err = p.fetchUserinfoClaims(ctx, tokenResp.AccessToken)
-			if err != nil {
+	if tokenResp.IDToken != "" {
+		claims, err = validateAndExtractIDTokenClaims(tokenResp.IDToken, creds.ClientID, time.Now())
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract claims from ID token: %w", err)
+		}
+	}
+	if claims == nil || claims.Email == "" {
+		fetchedClaims, fetchErr := p.fetchUserinfoClaimsWithClient(ctx, httpClient, tokenResp.AccessToken)
+		if fetchErr != nil {
+			if ctx.Err() != nil {
+				if ctx.Err() == context.DeadlineExceeded {
+					return nil, fmt.Errorf("authentication timed out: %w", ErrTimeout)
+				}
+				return nil, fmt.Errorf("authentication cancelled: %w", ErrUserCancelled)
+			}
+			if claims == nil {
 				claims = &auth.Claims{Issuer: "https://accounts.google.com"}
 			}
+		} else {
+			claims = fetchedClaims
 		}
 	}
 
@@ -194,24 +224,20 @@ func (p *Plugin) gcloudADCLogin(ctx context.Context, _ sdkplugin.LoginRequest) (
 		scopeStr = defaultGcloudADCScope
 	}
 
-	// Store metadata (but NOT the refresh token -- we leave that in gcloud's file)
-	if err := p.storeMetadataOnly(ctx, claims, auth.FlowGcloudADC, strings.Fields(scopeStr)); err != nil {
-		lgr.V(1).Info("warning: failed to store metadata", "error", err)
+	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprintHash(creds.ClientID), scopeStr)
+	initialToken := &auth.Token{
+		AccessToken: tokenResp.AccessToken,
+		TokenType:   tokenResp.TokenType,
+		ExpiresAt:   expiresAt,
+		Scope:       scopeStr,
+		Flow:        auth.FlowGcloudADC,
 	}
 
-	// Cache the access token
-	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-
-	hostClient := p.hostClient(ctx)
-	if hostClient != nil {
-		cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprintHash(creds.ClientID), scopeStr)
-		_ = cacheSet(ctx, hostClient, cacheKey, &auth.Token{
-			AccessToken: tokenResp.AccessToken,
-			TokenType:   tokenResp.TokenType,
-			ExpiresAt:   expiresAt,
-			Scope:       scopeStr,
-			Flow:        auth.FlowGcloudADC,
-		})
+	// Store metadata (but NOT the refresh token -- we leave that in gcloud's file)
+	// and atomically seed the cached access token under ctx's profile.
+	if _, err := p.storeMetadataAndSeedToken(ctx, claims, auth.FlowGcloudADC, strings.Fields(scopeStr), cacheKey, initialToken); err != nil {
+		return nil, fmt.Errorf("failed to store metadata: %w", err)
 	}
 
 	lgr.V(1).Info("gcloud ADC fallback login successful", "email", claims.Email)
@@ -224,7 +250,24 @@ func (p *Plugin) gcloudADCLogin(ctx context.Context, _ sdkplugin.LoginRequest) (
 
 // getGcloudADCToken refreshes a token using gcloud ADC credentials, with caching.
 func (p *Plugin) getGcloudADCToken(ctx context.Context, scope string, forceRefresh bool) (*auth.Token, error) {
+	return p.getGcloudADCTokenWithMinValidFor(ctx, scope, forceRefresh, DefaultMinValidFor)
+}
+
+func (p *Plugin) getGcloudADCTokenWithMinValidFor(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
+
+	if minValidFor <= 0 {
+		minValidFor = DefaultMinValidFor
+	}
+
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	creds, err := LoadGcloudADCCredentials()
 	if err != nil {
@@ -232,16 +275,22 @@ func (p *Plugin) getGcloudADCToken(ctx context.Context, scope string, forceRefre
 	}
 
 	fingerprint := fingerprintHash(creds.ClientID)
+	prefix := p.tokenCachePrefix(ctx)
+	sessionID := p.readFlowSessionID(ctx, auth.FlowGcloudADC, "")
+	cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprint, scope)
 
 	// Check cache first
 	if !forceRefresh {
-		hostClient := p.hostClient(ctx)
-		if hostClient != nil {
-			cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprint, scope)
-			cached, cacheErr := cacheGet(ctx, hostClient, cacheKey)
-			if cacheErr == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
-				lgr.V(1).Info("using cached gcloud ADC token", "scope", scope)
-				return cached, nil
+		if hostClient := p.hostClient(ctx); hostClient != nil {
+			cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
+			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) {
+				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
+					if cached.Flow == "" {
+						cached.Flow = auth.FlowGcloudADC
+					}
+					lgr.V(1).Info("using cached gcloud ADC token", "scope", scope)
+					return cached, nil
+				}
 			}
 		}
 	}
@@ -253,21 +302,24 @@ func (p *Plugin) getGcloudADCToken(ctx context.Context, scope string, forceRefre
 	data.Set("client_secret", creds.ClientSecret)
 	data.Set("refresh_token", creds.RefreshToken)
 
-	resp, err := p.httpClient.PostForm(ctx, tokenEndpoint, data)
+	resp, err := httpClient.PostForm(ctx, tokenEndpoint, data)
 	if err != nil {
 		return nil, fmt.Errorf("gcloud ADC token refresh failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		var errResp TokenErrorResponse
-		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		_ = json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&errResp)
 		return nil, formatGcloudTokenError(errResp, p.binaryName())
 	}
 
 	var tokenResp TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("gcloud ADC token refresh failed: token endpoint returned empty access_token")
 	}
 
 	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
@@ -277,19 +329,14 @@ func (p *Plugin) getGcloudADCToken(ctx context.Context, scope string, forceRefre
 		ExpiresAt:   expiresAt,
 		Scope:       scope,
 		Flow:        auth.FlowGcloudADC,
+		SessionID:   sessionID,
 	}
 
 	binaryName := p.binaryName()
 	lgr.V(1).Info("acquired token via gcloud ADC fallback",
 		"hint", fmt.Sprintf("to use %s-managed credentials run: %s auth login %s", binaryName, binaryName, HandlerName))
 
-	hostClient := p.hostClient(ctx)
-	if hostClient != nil {
-		cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprint, scope)
-		if cacheSetErr := cacheSet(ctx, hostClient, cacheKey, token); cacheSetErr != nil {
-			lgr.V(1).Info("failed to cache gcloud ADC token", "error", cacheSetErr)
-		}
-	}
+	p.cacheTokenForSession(ctx, cacheKey, token)
 
 	return token, nil
 }
@@ -307,16 +354,21 @@ func (p *Plugin) validateGcloudADCCredentials(ctx context.Context) error {
 	}
 
 	// Check cache first (read-only, no side effect).
-	// Uses defaultGcloudADCScope to match the cache key written by gcloudADCLogin when
-	// tokenResp.Scope is empty. Tokens cached under a server-returned scope (non-empty
-	// tokenResp.Scope) will miss here and fall through to the probe -- still correct.
-	hostClient := p.hostClient(ctx)
-	if hostClient != nil {
+	if hostClient := p.hostClient(ctx); hostClient != nil {
 		cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprintHash(creds.ClientID), defaultGcloudADCScope)
-		cached, cacheErr := cacheGet(ctx, hostClient, cacheKey)
+		cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, p.tokenCachePrefix(ctx), cacheKey)
 		if cacheErr == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
 			return nil
 		}
+	}
+
+	cfg, err := p.effectiveConfig(ctx)
+	if err != nil {
+		return err
+	}
+	httpClient, err := p.httpClientForConfig(ctx, cfg)
+	if err != nil {
+		return err
 	}
 
 	// No valid cached token -- probe the token endpoint without persisting the result.
@@ -326,24 +378,22 @@ func (p *Plugin) validateGcloudADCCredentials(ctx context.Context) error {
 	data.Set("client_secret", creds.ClientSecret)
 	data.Set("refresh_token", creds.RefreshToken)
 
-	resp, err := p.httpClient.PostForm(ctx, tokenEndpoint, data)
+	resp, err := httpClient.PostForm(ctx, tokenEndpoint, data)
 	if err != nil {
 		return fmt.Errorf("gcloud ADC token refresh failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		var errResp TokenErrorResponse
-		if decodeErr := json.NewDecoder(resp.Body).Decode(&errResp); decodeErr != nil || errResp.Error == "" {
-			return fmt.Errorf("gcloud ADC token refresh failed: HTTP %d %s", resp.StatusCode, resp.Status)
+		if decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&errResp); decodeErr != nil || errResp.Error == "" {
+			return fmt.Errorf("gcloud ADC token refresh failed: HTTP %d %s", resp.StatusCode, sanitizeControlChars(resp.Status))
 		}
 		return formatGcloudTokenError(errResp, p.binaryName())
 	}
 
-	// Decode and validate the response body -- a 200 with a missing access_token
-	// (e.g., unexpected HTML or partial JSON from a proxy) should not be treated as valid.
 	var tokenResp TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&tokenResp); err != nil {
 		return fmt.Errorf("gcloud ADC validation: unexpected token response: %w", err)
 	}
 	if tokenResp.AccessToken == "" {
