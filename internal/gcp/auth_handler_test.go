@@ -145,18 +145,33 @@ func TestGetStatus_WithMetadata(t *testing.T) {
 			Subject: "user@example.com",
 			Email:   "user@example.com",
 		},
-		Flow:      auth.FlowInteractive,
-		Scopes:    []string{"openid"},
-		SessionID: "test-session-id",
+		Flow:           auth.FlowInteractive,
+		Scopes:         []string{"openid"},
+		SessionID:      "test-session-id",
+		NoRefreshToken: true,
 	}
 	metaBytes, _ := json.Marshal(metadata)
 	fake.secrets[SecretKeyMetadata] = string(metaBytes)
+
+	wantExpiry := time.Now().Add(time.Hour).Truncate(time.Second)
+	cacheKey := buildCacheKey(auth.FlowInteractive, fingerprintHash(DefaultADCClientID), "")
+	entryBytes, _ := json.Marshal(tokenCacheEntry{
+		AccessToken: "cached-session-token",
+		TokenType:   "Bearer",
+		ExpiresAt:   wantExpiry,
+		Scope:       "openid",
+		CachedAt:    time.Now(),
+		Flow:        auth.FlowInteractive,
+		SessionID:   "test-session-id",
+	})
+	fake.secrets[SecretKeyTokenPrefix+cacheKey] = string(entryBytes)
 
 	status, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
 	require.NoError(t, err)
 	assert.True(t, status.Authenticated)
 	assert.Equal(t, "user@example.com", status.Claims.Email)
 	assert.Equal(t, auth.IdentityTypeUser, status.IdentityType)
+	assert.True(t, status.ExpiresAt.Equal(wantExpiry))
 }
 
 func TestGetStatus_UnknownHandler(t *testing.T) {

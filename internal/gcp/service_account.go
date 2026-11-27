@@ -51,7 +51,7 @@ func getServiceAccountKeyFromPath(path string, explicit bool) (*ServiceAccountKe
 		return nil, ErrNoServiceAccountConfigured
 	}
 
-	data, err := os.ReadFile(path) //nolint:gosec // G304/G703: path from operator config or GOOGLE_APPLICATION_CREDENTIALS
+	data, err := readCredentialFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading service account key file: %w", err)
 	}
@@ -260,12 +260,6 @@ func (p *Plugin) getServiceAccountToken(ctx context.Context, scope string, force
 }
 
 func (p *Plugin) getServiceAccountTokenWithMinValidFor(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
-	lgr := logr.FromContextOrDiscard(ctx)
-
-	if minValidFor <= 0 {
-		minValidFor = DefaultMinValidFor
-	}
-
 	cfg, err := p.effectiveConfig(ctx)
 	if err != nil {
 		return nil, err
@@ -278,6 +272,16 @@ func (p *Plugin) getServiceAccountTokenWithMinValidFor(ctx context.Context, scop
 			return nil, ErrNotAuthenticated
 		}
 		return nil, fmt.Errorf("service account credentials error: %w", err)
+	}
+
+	return p.getServiceAccountTokenForKey(ctx, key, scope, forceRefresh, minValidFor)
+}
+
+func (p *Plugin) getServiceAccountTokenForKey(ctx context.Context, key *ServiceAccountKey, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
+	lgr := logr.FromContextOrDiscard(ctx)
+
+	if minValidFor <= 0 {
+		minValidFor = DefaultMinValidFor
 	}
 
 	fingerprint := fingerprintHash(key.ClientEmail)
@@ -293,6 +297,9 @@ func (p *Plugin) getServiceAccountTokenWithMinValidFor(ctx context.Context, scop
 				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
 					if cached.Flow == "" {
 						cached.Flow = auth.FlowServicePrincipal
+					}
+					if cached.SessionID == "" && sessionID != "" {
+						cached.SessionID = sessionID
 					}
 					lgr.V(1).Info("using cached SA token", "scope", scope)
 					return cached, nil

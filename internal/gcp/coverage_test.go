@@ -678,7 +678,7 @@ func TestGetGcloudADCToken_Cached(t *testing.T) {
 	require.NoError(t, os.WriteFile(adcDir+"/application_default_credentials.json", adcBytes, 0o600))
 
 	scope := "cloud-platform"
-	fingerprint := fingerprintHash("gcloud-client-id")
+	fingerprint := gcloudADCFingerprint(&adcCreds)
 	cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprint, scope)
 	entry := tokenCacheEntry{
 		AccessToken: "cached-gcloud-at",

@@ -113,36 +113,27 @@ func (p *Plugin) storeCredentialsWithClaims(ctx context.Context, cfg *Config, to
 	mu.Lock()
 	defer mu.Unlock()
 
-	return p.storeCredentialsLocked(ctx, cfg, tokenResp, flow, scopes, sessionID, clientID, preExtractedClaims)
+	return p.storeCredentialsLockedWithSeedAndHook(ctx, cfg, tokenResp, flow, scopes, sessionID, clientID, preExtractedClaims, false, false, "", nil, nil)
 }
 
 // storeCredentialsAndSeedToken atomically commits session credentials, clears
 // stale cached access tokens for the profile, and seeds initialToken (stamped
 // with the committed SessionID) inside one profile write-lock critical section.
 func (p *Plugin) storeCredentialsAndSeedToken(ctx context.Context, cfg *Config, tokenResp *TokenResponse, flow auth.Flow, scopes []string, sessionID string, clientID string, preExtractedClaims *auth.Claims, initialCacheKey string, initialToken *auth.Token) (string, error) {
+	return p.storeCredentialsAndSeedTokenWithHook(ctx, cfg, tokenResp, flow, scopes, sessionID, clientID, preExtractedClaims, initialCacheKey, initialToken, nil)
+}
+
+// storeCredentialsAndSeedTokenWithHook atomically stages session credentials
+// and any initial access-token seed under the profile write lock, invokes
+// commitHook (when non-nil) to coordinate external outcome settlement such as
+// localhost OAuth callback completion, and rolls back all staged writes to the
+// pre-login snapshot if commitHook returns an error.
+func (p *Plugin) storeCredentialsAndSeedTokenWithHook(ctx context.Context, cfg *Config, tokenResp *TokenResponse, flow auth.Flow, scopes []string, sessionID string, clientID string, preExtractedClaims *auth.Claims, initialCacheKey string, initialToken *auth.Token, commitHook func(context.Context) error) (string, error) {
 	mu := p.profileLock(ctx)
 	mu.Lock()
 	defer mu.Unlock()
 
-	committedSessionID, err := p.storeCredentialsLocked(ctx, cfg, tokenResp, flow, scopes, sessionID, clientID, preExtractedClaims)
-	if err != nil {
-		return "", err
-	}
-
-	if hostClient := p.hostClient(ctx); hostClient != nil {
-		lgr := logr.FromContextOrDiscard(ctx)
-		prefix := p.tokenCachePrefix(ctx)
-		cacheClearWithPrefix(ctx, lgr, hostClient, prefix)
-		if initialToken != nil && initialCacheKey != "" && initialToken.AccessToken != "" {
-			seeded := *initialToken
-			seeded.SessionID = committedSessionID
-			if err := cacheSetWithPrefix(ctx, hostClient, prefix, initialCacheKey, &seeded); err != nil {
-				lgr.V(1).Info("failed to seed initial access token", "error", err)
-			}
-		}
-	}
-
-	return committedSessionID, nil
+	return p.storeCredentialsLockedWithSeedAndHook(ctx, cfg, tokenResp, flow, scopes, sessionID, clientID, preExtractedClaims, false, true, initialCacheKey, initialToken, commitHook)
 }
 
 // storeRotatedCredentials updates stored credentials for a refresh-token
@@ -168,7 +159,7 @@ func (p *Plugin) storeRotatedCredentials(ctx context.Context, cfg *Config, token
 	}
 	var curMeta TokenMetadata
 	if parseErr := json.Unmarshal([]byte(curMetaRaw), &curMeta); parseErr != nil {
-		return nil
+		return fmt.Errorf("failed to parse current session metadata: %w", parseErr)
 	}
 	if curMeta.SessionID != expectedMeta.SessionID ||
 		curMeta.RefreshTokenID != expectedMeta.RefreshTokenID ||
@@ -178,7 +169,10 @@ func (p *Plugin) storeRotatedCredentials(ctx context.Context, cfg *Config, token
 	}
 	if expectedMeta.RefreshTokenID == "" && expectedMeta.RefreshTokenHash == "" && expectedRefreshToken != "" {
 		legacyRT, legacyFound, legacyErr := hostClient.GetSecret(ctx, p.secretKey(ctx, secretSuffixRefreshToken))
-		if legacyErr != nil || !legacyFound || legacyRT != expectedRefreshToken {
+		if legacyErr != nil {
+			return fmt.Errorf("failed to inspect current refresh token: %w", legacyErr)
+		}
+		if !legacyFound || legacyRT != expectedRefreshToken {
 			return nil
 		}
 	}
@@ -190,11 +184,33 @@ func (p *Plugin) storeRotatedCredentials(ctx context.Context, cfg *Config, token
 	preservedCfg.Project = expectedMeta.Project
 	preservedCfg.ImpersonateServiceAccount = expectedMeta.ImpersonateServiceAccount
 
-	_, err = p.storeCredentialsLocked(ctx, preservedCfg, tokenResp, expectedMeta.Flow, expectedMeta.Scopes, expectedMeta.SessionID, clientID, expectedMeta.Claims)
+	_, err = p.storeCredentialsLockedWithSeedAndHook(ctx, preservedCfg, tokenResp, expectedMeta.Flow, expectedMeta.Scopes, expectedMeta.SessionID, clientID, expectedMeta.Claims, true, false, "", nil, nil)
 	return err
 }
 
-func (p *Plugin) storeCredentialsLocked(ctx context.Context, cfg *Config, tokenResp *TokenResponse, flow auth.Flow, scopes []string, sessionID string, clientID string, preExtractedClaims *auth.Claims) (string, error) {
+func restoreSecretSnapshot(ctx context.Context, hostClient *sdkplugin.HostServiceClient, key string, hadPrev bool, prevRaw string) {
+	if hadPrev {
+		_ = hostClient.SetSecret(ctx, key, prevRaw)
+	} else {
+		_ = hostClient.DeleteSecret(ctx, key)
+	}
+}
+
+func (p *Plugin) storeCredentialsLockedWithSeedAndHook(
+	ctx context.Context,
+	cfg *Config,
+	tokenResp *TokenResponse,
+	flow auth.Flow,
+	scopes []string,
+	sessionID string,
+	clientID string,
+	preExtractedClaims *auth.Claims,
+	isRotation bool,
+	clearCache bool,
+	initialCacheKey string,
+	initialToken *auth.Token,
+	commitHook func(context.Context) error,
+) (string, error) {
 	hostClient := p.hostClient(ctx)
 	if hostClient == nil {
 		return "", fmt.Errorf("host service not available")
@@ -217,6 +233,31 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, cfg *Config, tokenR
 
 	if sessionID == "" {
 		sessionID = uuid.New().String()
+	}
+
+	hasInitialSeed := clearCache && initialToken != nil && initialCacheKey != "" && initialToken.AccessToken != ""
+	requireSeed := clearCache && !isRotation && tokenResp.RefreshToken == "" && isRefreshTokenFlow(flow)
+	if requireSeed {
+		if !hasInitialSeed {
+			return "", fmt.Errorf("cannot commit %s session without a refresh token or initial access token", flow)
+		}
+		if !initialToken.IsValidFor(DefaultMinValidFor) {
+			return "", fmt.Errorf("cannot commit %s session without a refresh token: initial access token lifetime does not satisfy minimum validity (%s)", flow, DefaultMinValidFor)
+		}
+	}
+
+	var seedFullKey string
+	var seedRaw string
+	prefix := p.tokenCachePrefix(ctx)
+	if hasInitialSeed {
+		seeded := *initialToken
+		seeded.SessionID = sessionID
+		marshaledSeed, seedMarshalErr := marshalTokenCacheEntry(&seeded)
+		if seedMarshalErr != nil {
+			return "", seedMarshalErr
+		}
+		seedFullKey = prefix + initialCacheKey
+		seedRaw = marshaledSeed
 	}
 
 	metadata := &TokenMetadata{
@@ -248,58 +289,266 @@ func (p *Plugin) storeCredentialsLocked(ctx context.Context, cfg *Config, tokenR
 	legacyRefreshKey := p.secretKey(ctx, secretSuffixRefreshToken)
 	metadataKey := p.secretKey(ctx, secretSuffixMetadata)
 
+	// Snapshot prior state before writing any secrets so a failed snapshot read
+	// never proceeds into an unrecoverable partial write or lost-ack commit.
 	prevMetaRaw, hadPrevMeta, prevMetaErr := hostClient.GetSecret(ctx, metadataKey)
+	if prevMetaErr != nil {
+		return "", fmt.Errorf("reading previous session metadata: %w", prevMetaErr)
+	}
 	var prevRevID string
-	if prevMetaErr == nil && hadPrevMeta {
+	if hadPrevMeta {
 		var prevMeta TokenMetadata
 		if pErr := json.Unmarshal([]byte(prevMetaRaw), &prevMeta); pErr == nil {
 			prevRevID = prevMeta.RefreshTokenID
 		}
 	}
 
+	var prevLegacyRaw string
+	var hadPrevLegacy bool
+	if !isRotation && tokenResp.RefreshToken != "" {
+		var prevLegacyErr error
+		prevLegacyRaw, hadPrevLegacy, prevLegacyErr = hostClient.GetSecret(ctx, legacyRefreshKey)
+		if prevLegacyErr != nil {
+			return "", fmt.Errorf("reading previous refresh token: %w", prevLegacyErr)
+		}
+	}
+
+	var prevSeedRaw string
+	var hadPrevSeed bool
+	if hasInitialSeed {
+		var prevSeedErr error
+		prevSeedRaw, hadPrevSeed, prevSeedErr = hostClient.GetSecret(ctx, seedFullKey)
+		if prevSeedErr != nil {
+			return "", fmt.Errorf("reading previous cached access token: %w", prevSeedErr)
+		}
+	}
+
+	var verRefreshKey string
+	if revID != "" {
+		verRefreshKey = p.versionedRefreshKey(ctx, revID)
+	}
+
+	// Guard initial/replacement logins against panics during multi-secret staging
+	// or callback settlement so stored session state rolls back to the pre-login
+	// snapshot before re-raising the panic. Disarmed once staging and any
+	// callback settlement hook succeed.
+	committed := isRotation
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if !committed {
+			func() {
+				defer func() { _ = recover() }()
+				reconcileCtx, reconcileCancel := p.newCleanupContext(ctx)
+				defer reconcileCancel()
+
+				restoreSecretSnapshot(reconcileCtx, hostClient, metadataKey, hadPrevMeta, prevMetaRaw)
+				if tokenResp.RefreshToken != "" {
+					restoreSecretSnapshot(reconcileCtx, hostClient, legacyRefreshKey, hadPrevLegacy, prevLegacyRaw)
+					if hasInitialSeed {
+						restoreSecretSnapshot(reconcileCtx, hostClient, seedFullKey, hadPrevSeed, prevSeedRaw)
+					}
+					if verifyRaw, verifyFound, verifyErr := hostClient.GetSecret(reconcileCtx, metadataKey); verifyErr == nil {
+						var verifyMeta TokenMetadata
+						stillReferenced := verifyFound && json.Unmarshal([]byte(verifyRaw), &verifyMeta) == nil && verifyMeta.RefreshTokenID == revID
+						if !stillReferenced {
+							_ = hostClient.DeleteSecret(reconcileCtx, verRefreshKey)
+						}
+					}
+				} else if hasInitialSeed {
+					if verifyRaw, verifyFound, verifyErr := hostClient.GetSecret(reconcileCtx, metadataKey); verifyErr == nil {
+						var verifyMeta TokenMetadata
+						stillActive := verifyFound && json.Unmarshal([]byte(verifyRaw), &verifyMeta) == nil && verifyMeta.SessionID == sessionID
+						if !stillActive {
+							restoreSecretSnapshot(reconcileCtx, hostClient, seedFullKey, hadPrevSeed, prevSeedRaw)
+						}
+					}
+				}
+			}()
+		}
+		panic(r)
+	}()
+
+	lgr := logr.FromContextOrDiscard(ctx)
+	var seededKey string
+
 	if tokenResp.RefreshToken != "" {
-		verRefreshKey := p.versionedRefreshKey(ctx, revID)
 		// 1. Write the new refresh token under a unique revision key first so no
 		// existing or concurrent login's refresh token is overwritten before
 		// metadata commits.
 		if err := hostClient.SetSecret(ctx, verRefreshKey, tokenResp.RefreshToken); err != nil {
+			reconcileCtx, reconcileCancel := p.newCleanupContext(ctx)
+			_ = hostClient.DeleteSecret(reconcileCtx, verRefreshKey)
+			reconcileCancel()
 			return "", fmt.Errorf("failed to store refresh token: %w", err)
 		}
 
-		// 2. Single forward commit point: write metadata pointing at verRefreshKey
-		// and its SHA-256 fingerprint. On failure, delete our unreferenced
-		// verRefreshKey under a bounded cleanup timeout.
+		// 2. Write metadata pointing at verRefreshKey and its SHA-256 fingerprint.
+		// Reconcile SetSecret errors via bounded read-back: restore prior metadata
+		// on failed logins, and delete verRefreshKey only after confirming
+		// metadataKey does not reference revID.
 		if err := hostClient.SetSecret(ctx, metadataKey, metadataRaw); err != nil {
-			cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
-			defer cleanupCancel()
-			_ = hostClient.DeleteSecret(cleanupCtx, verRefreshKey)
+			reconcileCtx, reconcileCancel := p.newCleanupContext(ctx)
+			curMetaRaw, curFound, readErr := hostClient.GetSecret(reconcileCtx, metadataKey)
+			if readErr != nil {
+				reconcileCancel()
+				return "", fmt.Errorf("failed to store metadata: %w", err)
+			}
+
+			var curMeta TokenMetadata
+			committedOurRev := curFound && json.Unmarshal([]byte(curMetaRaw), &curMeta) == nil && curMeta.RefreshTokenID == revID
+			if !committedOurRev {
+				_ = hostClient.DeleteSecret(reconcileCtx, verRefreshKey)
+				reconcileCancel()
+				return "", fmt.Errorf("failed to store metadata: %w", err)
+			}
+
+			// During refresh-token rotation the previous grant was already consumed
+			// by Google, so keep the committed rotation rather than rolling back.
+			if !isRotation {
+				restoreSecretSnapshot(reconcileCtx, hostClient, metadataKey, hadPrevMeta, prevMetaRaw)
+				if verifyRaw, verifyFound, verifyErr := hostClient.GetSecret(reconcileCtx, metadataKey); verifyErr == nil {
+					var verifyMeta TokenMetadata
+					stillReferenced := verifyFound && json.Unmarshal([]byte(verifyRaw), &verifyMeta) == nil && verifyMeta.RefreshTokenID == revID
+					if !stillReferenced {
+						_ = hostClient.DeleteSecret(reconcileCtx, verRefreshKey)
+					}
+				}
+				reconcileCancel()
+				return "", fmt.Errorf("failed to store metadata: %w", err)
+			}
+			reconcileCancel()
+		}
+
+		// 3. Best-effort mirror to legacyRefreshKey under a bounded context so a
+		// stalled host never blocks Login or callback settlement indefinitely.
+		mirrorCtx, mirrorCancel := p.newCleanupContext(ctx)
+		if err := hostClient.SetSecret(mirrorCtx, legacyRefreshKey, tokenResp.RefreshToken); err != nil {
+			lgr.V(1).Info("warning: failed to mirror refresh token to legacy secret key", "error", err)
+		}
+		mirrorCancel()
+
+		// 4. Stage initial access token before commitHook so cancellation during
+		// any write rolls back cleanly before stale cache entries or prior
+		// refresh-token revisions are deleted.
+		if hasInitialSeed {
+			seedCtx, seedCancel := p.newCleanupContext(ctx)
+			if seedErr := hostClient.SetSecret(seedCtx, seedFullKey, seedRaw); seedErr != nil {
+				lgr.V(1).Info("failed to seed initial access token", "error", seedErr)
+			} else {
+				seededKey = seedFullKey
+			}
+			seedCancel()
+		}
+
+		if commitHook != nil {
+			if hookErr := commitHook(ctx); hookErr != nil {
+				reconcileCtx, reconcileCancel := p.newCleanupContext(ctx)
+				restoreSecretSnapshot(reconcileCtx, hostClient, metadataKey, hadPrevMeta, prevMetaRaw)
+				restoreSecretSnapshot(reconcileCtx, hostClient, legacyRefreshKey, hadPrevLegacy, prevLegacyRaw)
+				if hasInitialSeed {
+					restoreSecretSnapshot(reconcileCtx, hostClient, seedFullKey, hadPrevSeed, prevSeedRaw)
+				}
+				if verifyRaw, verifyFound, verifyErr := hostClient.GetSecret(reconcileCtx, metadataKey); verifyErr == nil {
+					var verifyMeta TokenMetadata
+					stillReferenced := verifyFound && json.Unmarshal([]byte(verifyRaw), &verifyMeta) == nil && verifyMeta.RefreshTokenID == revID
+					if !stillReferenced {
+						_ = hostClient.DeleteSecret(reconcileCtx, verRefreshKey)
+					}
+				}
+				reconcileCancel()
+				return "", hookErr
+			}
+		}
+		committed = true
+	} else {
+		// For refresh-token-less user sessions, stage the initial access token
+		// BEFORE mutating metadata or clearing prior credentials/cache so a seed
+		// failure preserves the previous session and cache intact.
+		if hasInitialSeed {
+			if seedErr := hostClient.SetSecret(ctx, seedFullKey, seedRaw); seedErr != nil {
+				reconcileCtx, reconcileCancel := p.newCleanupContext(ctx)
+				restoreSecretSnapshot(reconcileCtx, hostClient, seedFullKey, hadPrevSeed, prevSeedRaw)
+				reconcileCancel()
+				if requireSeed {
+					return "", fmt.Errorf("failed to seed initial access token: %w", seedErr)
+				}
+				lgr.V(1).Info("failed to seed initial access token", "error", seedErr)
+			} else {
+				seededKey = seedFullKey
+			}
+		}
+
+		if err := hostClient.SetSecret(ctx, metadataKey, metadataRaw); err != nil {
+			reconcileCtx, reconcileCancel := p.newCleanupContext(ctx)
+			curMetaRaw, curFound, readErr := hostClient.GetSecret(reconcileCtx, metadataKey)
+			if readErr == nil {
+				var curMeta TokenMetadata
+				committedOurSession := curFound && json.Unmarshal([]byte(curMetaRaw), &curMeta) == nil && curMeta.SessionID == sessionID
+				if !committedOurSession {
+					if seededKey != "" {
+						restoreSecretSnapshot(reconcileCtx, hostClient, seedFullKey, hadPrevSeed, prevSeedRaw)
+					}
+				} else {
+					restoreSecretSnapshot(reconcileCtx, hostClient, metadataKey, hadPrevMeta, prevMetaRaw)
+					if seededKey != "" {
+						if verifyRaw, verifyFound, verifyErr := hostClient.GetSecret(reconcileCtx, metadataKey); verifyErr == nil {
+							var verifyMeta TokenMetadata
+							stillActive := verifyFound && json.Unmarshal([]byte(verifyRaw), &verifyMeta) == nil && verifyMeta.SessionID == sessionID
+							if !stillActive {
+								restoreSecretSnapshot(reconcileCtx, hostClient, seedFullKey, hadPrevSeed, prevSeedRaw)
+							}
+						}
+					}
+				}
+			}
+			reconcileCancel()
 			return "", fmt.Errorf("failed to store metadata: %w", err)
 		}
 
-		// 3. Best-effort mirror to legacyRefreshKey for backward compatibility.
-		if err := hostClient.SetSecret(ctx, legacyRefreshKey, tokenResp.RefreshToken); err != nil {
-			logr.FromContextOrDiscard(ctx).V(1).Info("warning: failed to mirror refresh token to legacy secret key", "error", err)
+		if commitHook != nil {
+			if hookErr := commitHook(ctx); hookErr != nil {
+				reconcileCtx, reconcileCancel := p.newCleanupContext(ctx)
+				restoreSecretSnapshot(reconcileCtx, hostClient, metadataKey, hadPrevMeta, prevMetaRaw)
+				if hasInitialSeed {
+					if verifyRaw, verifyFound, verifyErr := hostClient.GetSecret(reconcileCtx, metadataKey); verifyErr == nil {
+						var verifyMeta TokenMetadata
+						stillActive := verifyFound && json.Unmarshal([]byte(verifyRaw), &verifyMeta) == nil && verifyMeta.SessionID == sessionID
+						if !stillActive {
+							restoreSecretSnapshot(reconcileCtx, hostClient, seedFullKey, hadPrevSeed, prevSeedRaw)
+						}
+					}
+				}
+				reconcileCancel()
+				return "", hookErr
+			}
 		}
-	} else {
-		if err := hostClient.SetSecret(ctx, metadataKey, metadataRaw); err != nil {
-			return "", fmt.Errorf("failed to store metadata: %w", err)
-		}
+		committed = true
+
 		cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
-		defer cleanupCancel()
 		_ = hostClient.DeleteSecret(cleanupCtx, legacyRefreshKey)
+		cleanupCancel()
 	}
 
-	// 4. Garbage-collect the specific revision superseded by this write if it
-	// is no longer referenced by metadataKey.
+	// 5. Clear stale cached tokens (preserving seededKey) and garbage-collect
+	// the superseded refresh-token revision now that commit has succeeded.
+	if clearCache {
+		cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
+		cacheClearExceptWithPrefix(cleanupCtx, lgr, hostClient, prefix, seededKey)
+		cleanupCancel()
+	}
+
 	if prevRevID != "" && prevRevID != revID {
 		cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
-		defer cleanupCancel()
 		if curMetaRaw, curFound, curErr := hostClient.GetSecret(cleanupCtx, metadataKey); curErr == nil && curFound {
 			var curMeta TokenMetadata
 			if pErr := json.Unmarshal([]byte(curMetaRaw), &curMeta); pErr == nil && curMeta.RefreshTokenID != prevRevID {
 				_ = hostClient.DeleteSecret(cleanupCtx, p.versionedRefreshKey(ctx, prevRevID))
 			}
 		}
+		cleanupCancel()
 	}
 
 	return sessionID, nil
@@ -335,8 +584,11 @@ func (p *Plugin) storeMetadataWithInitialToken(ctx context.Context, claims *auth
 
 	metadataKey := p.secretKey(ctx, secretSuffixMetadata)
 	prevMetaRaw, hadPrevMeta, prevMetaErr := hostClient.GetSecret(ctx, metadataKey)
+	if prevMetaErr != nil {
+		return "", fmt.Errorf("reading previous session metadata: %w", prevMetaErr)
+	}
 	var prevRevID string
-	if prevMetaErr == nil && hadPrevMeta {
+	if hadPrevMeta {
 		var prevMeta TokenMetadata
 		if pErr := json.Unmarshal([]byte(prevMetaRaw), &prevMeta); pErr == nil {
 			prevRevID = prevMeta.RefreshTokenID
@@ -360,6 +612,14 @@ func (p *Plugin) storeMetadataWithInitialToken(ctx context.Context, claims *auth
 	}
 
 	if err := hostClient.SetSecret(ctx, metadataKey, string(metadataBytes)); err != nil {
+		reconcileCtx, reconcileCancel := p.newCleanupContext(ctx)
+		if curMetaRaw, curFound, readErr := hostClient.GetSecret(reconcileCtx, metadataKey); readErr == nil && curFound {
+			var curMeta TokenMetadata
+			if json.Unmarshal([]byte(curMetaRaw), &curMeta) == nil && curMeta.SessionID == sessionID {
+				restoreSecretSnapshot(reconcileCtx, hostClient, metadataKey, hadPrevMeta, prevMetaRaw)
+			}
+		}
+		reconcileCancel()
 		return "", fmt.Errorf("failed to store metadata: %w", err)
 	}
 
@@ -367,23 +627,28 @@ func (p *Plugin) storeMetadataWithInitialToken(ctx context.Context, claims *auth
 	// session in this profile so GetStatus/GetToken do not treat this profile as
 	// refresh-token-backed.
 	cleanupCtx, cleanupCancel := p.newCleanupContext(ctx)
-	defer cleanupCancel()
 	_ = hostClient.DeleteSecret(cleanupCtx, p.secretKey(ctx, secretSuffixRefreshToken))
 	if prevRevID != "" {
 		_ = hostClient.DeleteSecret(cleanupCtx, p.versionedRefreshKey(ctx, prevRevID))
 	}
+	cleanupCancel()
 
 	if clearCache {
 		lgr := logr.FromContextOrDiscard(ctx)
 		prefix := p.tokenCachePrefix(ctx)
-		cacheClearWithPrefix(ctx, lgr, hostClient, prefix)
+		var seededKey string
 		if initialToken != nil && initialCacheKey != "" && initialToken.AccessToken != "" {
 			seeded := *initialToken
 			seeded.SessionID = sessionID
 			if err := cacheSetWithPrefix(ctx, hostClient, prefix, initialCacheKey, &seeded); err != nil {
 				lgr.V(1).Info("failed to seed initial access token", "error", err)
+			} else {
+				seededKey = prefix + initialCacheKey
 			}
 		}
+		clearCtx, clearCancel := p.newCleanupContext(ctx)
+		cacheClearExceptWithPrefix(clearCtx, lgr, hostClient, prefix, seededKey)
+		clearCancel()
 	}
 
 	return sessionID, nil
@@ -806,7 +1071,7 @@ func cacheSet(ctx context.Context, hostClient *sdkplugin.HostServiceClient, cach
 	return cacheSetWithPrefix(ctx, hostClient, tokenPrefixFromContext(ctx), cacheKey, token)
 }
 
-func cacheSetWithPrefix(ctx context.Context, hostClient *sdkplugin.HostServiceClient, prefix, cacheKey string, token *auth.Token) error {
+func marshalTokenCacheEntry(token *auth.Token) (string, error) {
 	entry := tokenCacheEntry{
 		AccessToken: token.AccessToken,
 		TokenType:   token.TokenType,
@@ -819,10 +1084,17 @@ func cacheSetWithPrefix(ctx context.Context, hostClient *sdkplugin.HostServiceCl
 
 	data, err := json.Marshal(entry) //nolint:gosec // intentional: caching token data in host secret store
 	if err != nil {
-		return fmt.Errorf("failed to marshal token for caching: %w", err)
+		return "", fmt.Errorf("failed to marshal token for caching: %w", err)
 	}
+	return string(data), nil
+}
 
-	return hostClient.SetSecret(ctx, prefix+cacheKey, string(data))
+func cacheSetWithPrefix(ctx context.Context, hostClient *sdkplugin.HostServiceClient, prefix, cacheKey string, token *auth.Token) error {
+	raw, err := marshalTokenCacheEntry(token)
+	if err != nil {
+		return err
+	}
+	return hostClient.SetSecret(ctx, prefix+cacheKey, raw)
 }
 
 // cacheClear removes all cached tokens from the host secret store for ctx's profile.
@@ -831,12 +1103,19 @@ func cacheClear(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.Host
 }
 
 func cacheClearWithPrefix(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.HostServiceClient, prefix string) {
+	cacheClearExceptWithPrefix(ctx, lgr, hostClient, prefix, "")
+}
+
+func cacheClearExceptWithPrefix(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.HostServiceClient, prefix, keepFullKey string) {
 	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
 	if err != nil {
 		lgr.V(1).Info("failed to list cached tokens", "error", err)
 		return
 	}
 	for _, key := range keys {
+		if keepFullKey != "" && key == keepFullKey {
+			continue
+		}
 		if err := hostClient.DeleteSecret(ctx, key); err != nil {
 			lgr.V(1).Info("failed to delete cached token", "key", key, "error", err)
 		}

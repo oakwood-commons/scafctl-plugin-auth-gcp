@@ -272,6 +272,9 @@ func (p *Plugin) getMetadataTokenWithMinValidFor(ctx context.Context, scope stri
 					if cached.Flow == "" {
 						cached.Flow = auth.FlowMetadata
 					}
+					if cached.SessionID == "" && sessionID != "" {
+						cached.SessionID = sessionID
+					}
 					lgr.V(1).Info("using cached metadata token", "scope", scope)
 					return cached, nil
 				}

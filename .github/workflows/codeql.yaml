@@ -15,6 +15,7 @@ concurrency:
 jobs:
   analyze:
     name: Analyze
+    if: ${{ !github.event.repository.private && github.event.repository.visibility != 'internal' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read

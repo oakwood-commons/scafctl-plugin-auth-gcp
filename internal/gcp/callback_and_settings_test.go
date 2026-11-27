@@ -162,6 +162,7 @@ func (s *capturingLogSink) Info(_ int, msg string, keysAndValues ...any) {
 	defer s.mu.Unlock()
 	s.lines = append(s.lines, fmt.Sprintf("%s %v", msg, keysAndValues))
 }
+
 func (s *capturingLogSink) Error(err error, msg string, keysAndValues ...any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1173,6 +1174,28 @@ func TestHTTPClientCache_IsolationCircuitBreakerAndEviction(t *testing.T) {
 		_, err = p.httpClientForConfig(context.Background(), badCfg)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid timeout duration")
+
+		badCIDRCfg, err := parseHandlerConfig([]byte(`{"httpClient":{"allowedPrivateCIDRs":["not-a-cidr"]}}`))
+		require.NoError(t, err)
+		_, err = p.httpClientForConfig(context.Background(), badCIDRCfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid allowedPrivateCIDRs")
+
+		// Equivalent allowedPrivateCIDRs in different order share one cached client; trustProxyResolution partitions cache keys
+		cidrCfgA, err := parseHandlerConfig([]byte(`{"httpClient":{"allowedPrivateCIDRs":["127.0.0.0/8","10.0.0.0/8"],"trustProxyResolution":true}}`))
+		require.NoError(t, err)
+		cidrCfgB, err := parseHandlerConfig([]byte(`{"httpClient":{"allowedPrivateCIDRs":["10.0.0.0/8","127.0.0.0/8"],"trustProxyResolution":true}}`))
+		require.NoError(t, err)
+		cidrCfgNoTrust, err := parseHandlerConfig([]byte(`{"httpClient":{"allowedPrivateCIDRs":["10.0.0.0/8","127.0.0.0/8"],"trustProxyResolution":false}}`))
+		require.NoError(t, err)
+		cidrClientA, err := p.httpClientForConfig(context.Background(), cidrCfgA)
+		require.NoError(t, err)
+		cidrClientB, err := p.httpClientForConfig(context.Background(), cidrCfgB)
+		require.NoError(t, err)
+		cidrClientNoTrust, err := p.httpClientForConfig(context.Background(), cidrCfgNoTrust)
+		require.NoError(t, err)
+		assert.Same(t, cidrClientA, cidrClientB)
+		assert.NotSame(t, cidrClientA, cidrClientNoTrust)
 
 		// Circuit breaker state persists across separate per-RPC Config instances sharing effective settings
 		cbJSON := `{"httpClient":{"timeout":"2s","retryMax":1,"retryWaitMin":"1ms","retryWaitMax":"2ms","allowPrivateIPs":true,"enableCircuitBreaker":true,"circuitBreakerMaxFailures":2,"circuitBreakerOpenTimeout":"1m"}}`
@@ -2700,4 +2723,1589 @@ func TestCredentialValidationAndSessionIsolation(t *testing.T) {
 		require.NotNil(t, surviving)
 		assert.Equal(t, "fresh-at", surviving.AccessToken)
 	})
+}
+
+func TestADCLogin_UserinfoFailurePreservesPriorSessionAndServesFailureHTML(t *testing.T) {
+	clearAmbientGCPEnv(t)
+
+	aliceJWT := makeTestIDToken(map[string]any{"sub": "alice-sub", "email": "alice@example.com"})
+
+	for _, tc := range []struct {
+		name        string
+		userinfoRes *http.Response
+		userinfoErr error
+		wantErr     string
+	}{
+		{
+			name:        "userinfo HTTP 500 error",
+			userinfoRes: jsonHTTPResponse(http.StatusInternalServerError, map[string]string{"error": "backend_down"}),
+			wantErr:     "failed to fetch userinfo claims",
+		},
+		{
+			name:        "userinfo network error",
+			userinfoErr: errors.New("userinfo connection reset"),
+			wantErr:     "failed to fetch userinfo claims",
+		},
+		{
+			name:        "userinfo missing sub claim",
+			userinfoRes: jsonHTTPResponse(http.StatusOK, map[string]string{"email": "nosub@example.com"}),
+			wantErr:     "missing sub claim",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _, _ := newTestPlugin(t)
+			wantSuccess, wantFailure := configureCustomCallbackPages(t, p)
+
+			var callNum atomic.Int32
+			p.httpClient = &blockingHTTPClient{
+				onPost: func(_ context.Context, _ string, data url.Values) (*http.Response, error) {
+					if data.Get("grant_type") == "refresh_token" {
+						return jsonHTTPResponse(http.StatusOK, TokenResponse{
+							AccessToken: "alice-refreshed-at",
+							TokenType:   "Bearer",
+							ExpiresIn:   3600,
+						}), nil
+					}
+					if callNum.Add(1) == 1 {
+						return jsonHTTPResponse(http.StatusOK, TokenResponse{
+							AccessToken:  "alice-at",
+							RefreshToken: "alice-rt",
+							TokenType:    "Bearer",
+							ExpiresIn:    3600,
+							IDToken:      aliceJWT,
+						}), nil
+					}
+					// Replacement login omits IDToken so adcLogin falls back to userinfo.
+					return jsonHTTPResponse(http.StatusOK, TokenResponse{
+						AccessToken:  "bob-at",
+						RefreshToken: "bob-rt",
+						TokenType:    "Bearer",
+						ExpiresIn:    3600,
+					}), nil
+				},
+			}
+
+			// First login succeeds for Alice.
+			p.openBrowser = func(_ context.Context, authURL string) error {
+				completeLoopbackCallback(t, authURL, "ALICE-CODE")
+				return nil
+			}
+			_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+			require.NoError(t, err)
+
+			// Override Get for userinfo failure on second login.
+			origPost := p.httpClient.(*blockingHTTPClient).onPost
+			p.httpClient = &userinfoMockClient{
+				onPost: origPost,
+				onGet: func(_ context.Context, _ string, _ map[string]string) (*http.Response, error) {
+					if tc.userinfoErr != nil {
+						return nil, tc.userinfoErr
+					}
+					return tc.userinfoRes, nil
+				},
+			}
+
+			statusCh := make(chan int, 1)
+			bodyCh := make(chan string, 1)
+			p.openBrowser = func(_ context.Context, authURL string) error {
+				u, _ := url.Parse(authURL)
+				go func() {
+					resp, getErr := http.Get(u.Query().Get("redirect_uri") + "/?code=BOB-CODE&state=" + url.QueryEscape(u.Query().Get("state"))) //nolint:noctx
+					if getErr != nil {
+						statusCh <- 0
+						bodyCh <- ""
+						return
+					}
+					b, _ := io.ReadAll(resp.Body)
+					_ = resp.Body.Close()
+					statusCh <- resp.StatusCode
+					bodyCh <- string(b)
+				}()
+				return nil
+			}
+
+			_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.Equal(t, http.StatusServiceUnavailable, <-statusCh)
+			body := <-bodyCh
+			assert.Equal(t, wantFailure, body)
+			assert.NotEqual(t, wantSuccess, body)
+
+			// Alice's session and refresh token must remain intact.
+			st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+			require.NoError(t, err)
+			require.True(t, st.Authenticated)
+			assert.Equal(t, "alice@example.com", st.Claims.Email)
+
+			tok, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+				Scope:        "openid",
+				ForceRefresh: true,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, "alice-refreshed-at", tok.AccessToken)
+		})
+	}
+}
+
+type userinfoMockClient struct {
+	onPost func(ctx context.Context, endpoint string, data url.Values) (*http.Response, error)
+	onGet  func(ctx context.Context, endpoint string, headers map[string]string) (*http.Response, error)
+	onDo   func(ctx context.Context, req *http.Request) (*http.Response, error)
+}
+
+func (u *userinfoMockClient) PostForm(ctx context.Context, endpoint string, data url.Values) (*http.Response, error) {
+	return u.onPost(ctx, endpoint, data)
+}
+
+func (u *userinfoMockClient) Get(ctx context.Context, endpoint string, headers map[string]string) (*http.Response, error) {
+	return u.onGet(ctx, endpoint, headers)
+}
+
+func (u *userinfoMockClient) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	if u.onDo != nil {
+		return u.onDo(ctx, req)
+	}
+	return jsonHTTPResponse(http.StatusInternalServerError, map[string]string{"error": "unexpected Do"}), nil
+}
+
+func TestConcurrentRefreshSerializationAndRotationPersistence(t *testing.T) {
+	t.Run("serializes concurrent GetToken and GetStatus refreshes across single-use grant rotation without holding profileLock during HTTP", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		p, _, _ := newTestPlugin(t)
+		_, err := p.storeCredentialsWithClaims(context.Background(), DefaultConfig(), &TokenResponse{
+			AccessToken:  "seed-at",
+			RefreshToken: "rt-gen-1",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      makeTestIDToken(map[string]any{"sub": "u-conc", "email": "conc@example.com"}),
+		}, auth.FlowInteractive, []string{"openid"}, "sess-conc", DefaultADCClientID, nil)
+		require.NoError(t, err)
+
+		firstRefreshEntered := make(chan struct{})
+		releaseFirstRefresh := make(chan struct{})
+		var usedMu sync.Mutex
+		usedGrants := map[string]bool{}
+		var postCalls atomic.Int32
+
+		// Simulate a single-use rotating OAuth server: any duplicate submission of an
+		// already-consumed refresh_token returns 400 invalid_grant immediately (which
+		// would arrive BEFORE the delayed first rotation response if refreshes raced).
+		p.httpClient = &blockingHTTPClient{
+			onPost: func(_ context.Context, _ string, data url.Values) (*http.Response, error) {
+				n := postCalls.Add(1)
+				rt := data.Get("refresh_token")
+
+				usedMu.Lock()
+				alreadyUsed := usedGrants[rt]
+				usedGrants[rt] = true
+				usedMu.Unlock()
+
+				if alreadyUsed {
+					return jsonHTTPResponse(http.StatusBadRequest, TokenErrorResponse{
+						Error:            "invalid_grant",
+						ErrorDescription: "refresh token already consumed",
+					}), nil
+				}
+
+				if n == 1 {
+					close(firstRefreshEntered)
+					<-releaseFirstRefresh
+				}
+
+				nextGen := fmt.Sprintf("rt-gen-%d", n+1)
+				return jsonHTTPResponse(http.StatusOK, TokenResponse{
+					AccessToken:  fmt.Sprintf("at-gen-%d", n),
+					RefreshToken: nextGen,
+					TokenType:    "Bearer",
+					ExpiresIn:    3600,
+				}), nil
+			},
+		}
+
+		// Launch concurrent GetToken (cache miss), GetToken (ForceRefresh), and GetStatus.
+		tok1Ch := make(chan *sdkplugin.TokenResponse, 1)
+		err1Ch := make(chan error, 1)
+		tok2Ch := make(chan *sdkplugin.TokenResponse, 1)
+		err2Ch := make(chan error, 1)
+		statusCh := make(chan *auth.Status, 1)
+		statusErrCh := make(chan error, 1)
+
+		go func() {
+			r, e := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "openid"})
+			tok1Ch <- r
+			err1Ch <- e
+		}()
+
+		<-firstRefreshEntered
+
+		// Give concurrent callers time to queue on refreshLock while first HTTP call is held.
+		go func() {
+			r, e := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "openid", ForceRefresh: true})
+			tok2Ch <- r
+			err2Ch <- e
+		}()
+		go func() {
+			s, e := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+			statusCh <- s
+			statusErrCh <- e
+		}()
+
+		// Verify profileLock is NOT held during the blocked HTTP call: ListCachedTokens
+		// (which acquires profileLock.RLock) must return immediately without blocking.
+		listDone := make(chan error, 1)
+		go func() {
+			_, lErr := p.ListCachedTokens(context.Background(), HandlerName)
+			listDone <- lErr
+		}()
+		select {
+		case lErr := <-listDone:
+			require.NoError(t, lErr)
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("ListCachedTokens blocked while HTTP refresh was in flight; profileLock must not be held across HTTP")
+		}
+
+		time.Sleep(25 * time.Millisecond)
+		close(releaseFirstRefresh)
+
+		require.NoError(t, <-err1Ch)
+		require.NoError(t, <-err2Ch)
+		require.NoError(t, <-statusErrCh)
+		assert.NotEmpty(t, (<-tok1Ch).AccessToken)
+		assert.NotEmpty(t, (<-tok2Ch).AccessToken)
+		assert.True(t, (<-statusCh).Authenticated)
+
+		// Session must still be intact and backed by the latest rotated refresh token.
+		_, curRT, hasRT, err := p.inspectStoredMetadataAndRefresh(context.Background())
+		require.NoError(t, err)
+		require.True(t, hasRT)
+		assert.Equal(t, fmt.Sprintf("rt-gen-%d", postCalls.Load()+1), curRT)
+	})
+
+	t.Run("GetStatus holding refreshLock first rotates grant without caching access token and queued GetStatus reloads rotated grant", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		p, _, _ := newTestPlugin(t)
+		_, err := p.storeCredentialsWithClaims(context.Background(), DefaultConfig(), &TokenResponse{
+			AccessToken:  "seed-at",
+			RefreshToken: "rt-status-1",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      makeTestIDToken(map[string]any{"sub": "u-st-conc", "email": "stconc@example.com"}),
+		}, auth.FlowInteractive, []string{"openid"}, "sess-st-conc", DefaultADCClientID, nil)
+		require.NoError(t, err)
+
+		firstProbeEntered := make(chan struct{})
+		releaseFirstProbe := make(chan struct{})
+		var usedMu sync.Mutex
+		usedGrants := map[string]bool{}
+		var postCalls atomic.Int32
+
+		p.httpClient = &blockingHTTPClient{
+			onPost: func(_ context.Context, _ string, data url.Values) (*http.Response, error) {
+				n := postCalls.Add(1)
+				rt := data.Get("refresh_token")
+
+				usedMu.Lock()
+				alreadyUsed := usedGrants[rt]
+				usedGrants[rt] = true
+				usedMu.Unlock()
+
+				if alreadyUsed {
+					return jsonHTTPResponse(http.StatusBadRequest, TokenErrorResponse{
+						Error:            "invalid_grant",
+						ErrorDescription: "refresh token already consumed",
+					}), nil
+				}
+
+				if n == 1 {
+					close(firstProbeEntered)
+					<-releaseFirstProbe
+				}
+
+				return jsonHTTPResponse(http.StatusOK, TokenResponse{
+					AccessToken:  fmt.Sprintf("status-at-%d", n),
+					RefreshToken: fmt.Sprintf("rt-status-%d", n+1),
+					TokenType:    "Bearer",
+					ExpiresIn:    3600,
+				}), nil
+			},
+		}
+
+		st1Ch := make(chan *auth.Status, 1)
+		st2Ch := make(chan *auth.Status, 1)
+		tokCh := make(chan *sdkplugin.TokenResponse, 1)
+		errCh := make(chan error, 3)
+
+		go func() {
+			s, e := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+			st1Ch <- s
+			errCh <- e
+		}()
+
+		<-firstProbeEntered
+
+		// Queue a second GetStatus while st1 holds refreshLock; because neither st1 nor
+		// st2 populates the access-token cache, st2 MUST reload rt-status-2 inside
+		// refreshLock and issue a second PostForm instead of reusing rt-status-1.
+		go func() {
+			s, e := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+			st2Ch <- s
+			errCh <- e
+		}()
+
+		time.Sleep(25 * time.Millisecond)
+		close(releaseFirstProbe)
+
+		for range 2 {
+			require.NoError(t, <-errCh)
+		}
+		assert.True(t, (<-st1Ch).Authenticated)
+		assert.True(t, (<-st2Ch).Authenticated)
+		assert.Equal(t, int32(2), postCalls.Load())
+
+		// Subsequent ForceRefresh GetToken reloads rt-status-3 seamlessly.
+		tokResp, tokErr := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "openid", ForceRefresh: true})
+		require.NoError(t, tokErr)
+		assert.NotEmpty(t, tokResp.AccessToken)
+		assert.Equal(t, int32(3), postCalls.Load())
+		_ = tokCh
+	})
+
+	t.Run("mintToken propagates rotated refresh token persistence failure without caching access token", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		p, fake, mockHTTP := newTestPlugin(t)
+		_, err := p.storeCredentialsWithClaims(context.Background(), DefaultConfig(), &TokenResponse{
+			AccessToken:  "init-at",
+			RefreshToken: "orig-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      makeTestIDToken(map[string]any{"sub": "u-rot-err", "email": "roterr@example.com"}),
+		}, auth.FlowInteractive, []string{"openid"}, "sess-rot-err", DefaultADCClientID, nil)
+		require.NoError(t, err)
+
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "rotated-at-must-not-cache",
+			RefreshToken: "rotated-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+		})
+
+		fake.mu.Lock()
+		fake.setSecretErr = errors.New("secret store write failed")
+		fake.mu.Unlock()
+
+		_, err = p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:        "openid",
+			ForceRefresh: true,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "persisting rotated refresh token")
+
+		fake.mu.Lock()
+		for k := range fake.secrets {
+			assert.False(t, strings.HasPrefix(k, SecretKeyTokenPrefix), "failed rotation must not cache access token")
+		}
+		fake.mu.Unlock()
+	})
+}
+
+func TestGcloudADC_AccountSwitchCacheIsolation(t *testing.T) {
+	clearAmbientGCPEnv(t)
+
+	adcDir := t.TempDir()
+	adcPath := filepath.Join(adcDir, "application_default_credentials.json")
+	t.Setenv(EnvCloudSDKConfig, adcDir)
+
+	writeADC := func(rt string) {
+		b, err := json.Marshal(GcloudADCCredentials{
+			ClientID:     DefaultADCClientID,
+			ClientSecret: DefaultADCClientSecret,
+			RefreshToken: rt,
+			Type:         "authorized_user",
+		})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(adcPath, b, 0o600))
+	}
+
+	p, _, _ := newTestPlugin(t)
+	var refreshCalls, iamCalls atomic.Int32
+	p.httpClient = &blockingHTTPClient{
+		onPost: func(_ context.Context, _ string, data url.Values) (*http.Response, error) {
+			refreshCalls.Add(1)
+			rt := data.Get("refresh_token")
+			if rt == "rt-revoked-B" {
+				return jsonHTTPResponse(http.StatusBadRequest, TokenErrorResponse{
+					Error:            "invalid_grant",
+					ErrorDescription: "account B revoked",
+				}), nil
+			}
+			return jsonHTTPResponse(http.StatusOK, TokenResponse{
+				AccessToken: "access-for-" + rt,
+				TokenType:   "Bearer",
+				ExpiresIn:   3600,
+				Scope:       defaultGcloudADCScope,
+			}), nil
+		},
+		onDo: func(_ context.Context, req *http.Request) (*http.Response, error) {
+			iamCalls.Add(1)
+			srcAuth := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+			return jsonHTTPResponse(http.StatusOK, ImpersonationResponse{
+				AccessToken: "imp-via-" + srcAuth,
+				ExpireTime:  time.Now().Add(time.Hour).Format(time.RFC3339),
+			}), nil
+		},
+	}
+
+	// 1. Account A login + token + impersonated token populate caches under DefaultADCClientID + hash(rt-A).
+	writeADC("rt-account-A")
+	_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowGcloudADC}, nil)
+	require.NoError(t, err)
+
+	tokA, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: defaultGcloudADCScope})
+	require.NoError(t, err)
+	assert.Equal(t, "access-for-rt-account-A", tokA.AccessToken)
+
+	impSettings := map[string]json.RawMessage{
+		"impersonateServiceAccount": json.RawMessage(`"target@proj.iam.gserviceaccount.com"`),
+	}
+	impA, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+		Scope:    defaultGcloudADCScope,
+		Settings: impSettings,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "imp-via-access-for-rt-account-A", impA.AccessToken)
+
+	// 2. Switch gcloud ADC file to Account B sharing the same DefaultADCClientID:
+	// neither direct GetToken nor impersonation may reuse Account A's cached token.
+	writeADC("rt-account-B")
+	tokB, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: defaultGcloudADCScope})
+	require.NoError(t, err)
+	assert.Equal(t, "access-for-rt-account-B", tokB.AccessToken)
+
+	impB, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+		Scope:    defaultGcloudADCScope,
+		Settings: impSettings,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "imp-via-access-for-rt-account-B", impB.AccessToken)
+	assert.Equal(t, int32(2), iamCalls.Load())
+
+	// 3. Switch gcloud ADC file to revoked Account B: GetStatus must NOT pass via Account A's cache entry.
+	writeADC("rt-revoked-B")
+	stB, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+	require.NoError(t, err)
+	assert.False(t, stB.Authenticated)
+	assert.Contains(t, stB.Reason, "invalid")
+}
+
+func TestStoreCredentials_LostMetadataAckReconciliationAndBoundedLegacyMirror(t *testing.T) {
+	clearAmbientGCPEnv(t)
+
+	aliceJWT := makeTestIDToken(map[string]any{"sub": "alice", "email": "alice@example.com"})
+	bobJWT := makeTestIDToken(map[string]any{"sub": "bob", "email": "bob@example.com"})
+
+	t.Run("lost SetSecret ack after host commits metadata restores prior session before deleting new revision", func(t *testing.T) {
+		p, fake, mockHTTP := newTestPlugin(t)
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at",
+			RefreshToken: "alice-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      aliceJWT,
+		})
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "bob-at",
+			RefreshToken: "bob-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      bobJWT,
+		})
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken: "alice-refreshed-at",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			completeLoopbackCallback(t, authURL, "ACK-CODE")
+			return nil
+		}
+
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.NoError(t, err)
+
+		// Fault injection: host writes metadata to its store, then the gRPC ack fails once.
+		var faultFired atomic.Bool
+		fake.mu.Lock()
+		fake.setSecretFunc = func(_ context.Context, name, value string) error {
+			if name == SecretKeyMetadata && !faultFired.Swap(true) {
+				fake.mu.Lock()
+				fake.secrets[name] = value
+				fake.mu.Unlock()
+				return errors.New("rpc error: code = DeadlineExceeded desc = lost SetSecret reply")
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.Error(t, err)
+
+		// Alice's session must be restored and consistent, and Bob's revision cleaned up.
+		st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		require.True(t, st.Authenticated)
+		assert.Equal(t, "alice@example.com", st.Claims.Email)
+
+		tok, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "openid", ForceRefresh: true})
+		require.NoError(t, err)
+		assert.Equal(t, "alice-refreshed-at", tok.AccessToken)
+
+		fake.mu.Lock()
+		for k, v := range fake.secrets {
+			if strings.HasPrefix(k, SecretKeyRefreshToken+".") {
+				assert.NotEqual(t, "bob-rt", v, "unreferenced revision must be deleted after rollback")
+			}
+		}
+		fake.mu.Unlock()
+	})
+
+	t.Run("lost SetSecret ack when rollback also fails preserves referenced refresh token revision so store stays consistent", func(t *testing.T) {
+		p, fake, mockHTTP := newTestPlugin(t)
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "bob-at",
+			RefreshToken: "bob-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      bobJWT,
+		})
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken: "bob-refreshed-at",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			completeLoopbackCallback(t, authURL, "ACK-NO-ROLLBACK")
+			return nil
+		}
+
+		// First SetSecret(metadata) commits then fails ack; subsequent DeleteSecret(metadata) fails too.
+		var metaSetCalls atomic.Int32
+		fake.mu.Lock()
+		fake.setSecretFunc = func(_ context.Context, name, value string) error {
+			if name == SecretKeyMetadata && metaSetCalls.Add(1) == 1 {
+				fake.mu.Lock()
+				fake.secrets[name] = value
+				fake.mu.Unlock()
+				return errors.New("lost SetSecret ack")
+			}
+			return nil
+		}
+		fake.deleteSecretFunc = func(_ context.Context, name string) error {
+			if name == SecretKeyMetadata {
+				return errors.New("rollback delete failed")
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.Error(t, err)
+
+		fake.mu.Lock()
+		fake.setSecretFunc = nil
+		fake.deleteSecretFunc = nil
+		fake.mu.Unlock()
+
+		// Because metadataKey still references bob's revID, bob's versioned refresh token
+		// must NOT have been deleted (no errInconsistentSession).
+		meta, rt, hasRT, err := p.inspectStoredMetadataAndRefresh(context.Background())
+		require.NoError(t, err)
+		require.True(t, hasRT)
+		assert.Equal(t, "bob-rt", rt)
+		assert.Equal(t, "bob@example.com", meta.Claims.Email)
+	})
+
+	t.Run("lost SetSecret ack during refresh-token rotation reconciles committed rotation without rolling back to consumed grant", func(t *testing.T) {
+		p, fake, _ := newTestPlugin(t)
+		_, err := p.storeCredentialsWithClaims(context.Background(), DefaultConfig(), &TokenResponse{
+			AccessToken:  "at-1",
+			RefreshToken: "consumed-rt-1",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      aliceJWT,
+		}, auth.FlowInteractive, []string{"openid"}, "sess-rot-ack", DefaultADCClientID, nil)
+		require.NoError(t, err)
+
+		origMeta, err := p.loadMetadata(context.Background())
+		require.NoError(t, err)
+
+		var faultFired atomic.Bool
+		fake.mu.Lock()
+		fake.setSecretFunc = func(_ context.Context, name, value string) error {
+			if name == SecretKeyMetadata && !faultFired.Swap(true) {
+				fake.mu.Lock()
+				fake.secrets[name] = value
+				fake.mu.Unlock()
+				return errors.New("lost SetSecret ack on rotation")
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		err = p.storeRotatedCredentials(context.Background(), DefaultConfig(), &TokenResponse{
+			AccessToken:  "at-2",
+			RefreshToken: "new-rt-2",
+		}, origMeta, "consumed-rt-1", DefaultADCClientID)
+		require.NoError(t, err)
+
+		_, curRT, hasRT, err := p.inspectStoredMetadataAndRefresh(context.Background())
+		require.NoError(t, err)
+		require.True(t, hasRT)
+		assert.Equal(t, "new-rt-2", curRT)
+	})
+
+	t.Run("stalled legacy-mirror SetSecret uses bounded cleanup context so Login and browser callback settle promptly", func(t *testing.T) {
+		p, fake, mockHTTP := newTestPlugin(t)
+		p.cleanupTimeout = 40 * time.Millisecond
+		wantSuccess, _ := configureCustomCallbackPages(t, p)
+
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "mirror-at",
+			RefreshToken: "mirror-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      aliceJWT,
+		})
+
+		mirrorDeadlineCh := make(chan bool, 1)
+		fake.mu.Lock()
+		fake.setSecretFunc = func(ctx context.Context, name, _ string) error {
+			if name == SecretKeyRefreshToken {
+				_, hasDeadline := ctx.Deadline()
+				select {
+				case mirrorDeadlineCh <- hasDeadline:
+				default:
+				}
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		browserStatusCh := make(chan int, 1)
+		browserBodyCh := make(chan string, 1)
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			u, _ := url.Parse(authURL)
+			go func() {
+				resp, getErr := http.Get(u.Query().Get("redirect_uri") + "/?code=MIRROR-CODE&state=" + url.QueryEscape(u.Query().Get("state"))) //nolint:noctx
+				if getErr != nil {
+					browserStatusCh <- 0
+					browserBodyCh <- ""
+					return
+				}
+				b, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				browserStatusCh <- resp.StatusCode
+				browserBodyCh <- string(b)
+			}()
+			return nil
+		}
+
+		started := time.Now()
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.NoError(t, err)
+		assert.Less(t, time.Since(started), 2*time.Second)
+		assert.True(t, <-mirrorDeadlineCh)
+		assert.Equal(t, http.StatusOK, <-browserStatusCh)
+		assert.Equal(t, wantSuccess, <-browserBodyCh)
+	})
+}
+
+func TestGetStatus_NoRefreshTokenUserSessions(t *testing.T) {
+	clearAmbientGCPEnv(t)
+
+	for _, flow := range []auth.Flow{auth.FlowInteractive, auth.FlowDeviceCode} {
+		t.Run(string(flow), func(t *testing.T) {
+			p, fake, mockHTTP := newTestPlugin(t)
+			p.config.ClientID = "nort-client"
+			p.config.ClientSecret = "nort-secret"
+
+			idTok := makeTestIDToken(map[string]any{
+				"aud":   "nort-client",
+				"sub":   "nort-sub",
+				"email": "nort@example.com",
+			})
+
+			if flow == auth.FlowInteractive {
+				mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+					AccessToken: "nort-access-token",
+					TokenType:   "Bearer",
+					ExpiresIn:   900,
+					IDToken:     idTok,
+				})
+				p.openBrowser = func(_ context.Context, authURL string) error {
+					completeLoopbackCallback(t, authURL, "NORT-STATUS")
+					return nil
+				}
+			} else {
+				mockHTTP.AddResponse(http.StatusOK, DeviceCodeResponse{
+					DeviceCode:      "dc-nort",
+					UserCode:        "UC-NORT",
+					VerificationURL: "https://accounts.google.com/device",
+					ExpiresIn:       300,
+					Interval:        1,
+				})
+				mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+					AccessToken: "nort-access-token",
+					TokenType:   "Bearer",
+					ExpiresIn:   900,
+					IDToken:     idTok,
+				})
+			}
+
+			loginResp, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: flow}, nil)
+			require.NoError(t, err)
+
+			// 1. While cached access token is usable, GetStatus returns Authenticated=true and reports its expiry without HTTP calls.
+			reqsBefore := len(mockHTTP.GetRequests())
+			stValid, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+			require.NoError(t, err)
+			require.True(t, stValid.Authenticated)
+			assert.False(t, stValid.ExpiresAt.IsZero())
+			assert.WithinDuration(t, loginResp.ExpiresAt, stValid.ExpiresAt, 2*time.Second)
+			assert.Len(t, mockHTTP.GetRequests(), reqsBefore, "GetStatus must not mint tokens for NoRefreshToken sessions")
+
+			// 2. When cached access token has less than DefaultMinValidFor remaining (or is expired),
+			// both GetStatus and GetToken treat the session as unauthenticated.
+			cacheKey := buildCacheKey(flow, fingerprintHash("nort-client"), "")
+			expiredBytes, _ := json.Marshal(tokenCacheEntry{
+				AccessToken: "nort-access-token",
+				TokenType:   "Bearer",
+				ExpiresAt:   time.Now().Add(-time.Minute),
+				CachedAt:    time.Now().Add(-15 * time.Minute),
+				Flow:        flow,
+				SessionID:   func() string { m, _ := p.loadMetadata(context.Background()); return m.SessionID }(),
+			})
+			fake.mu.Lock()
+			fake.secrets[SecretKeyTokenPrefix+cacheKey] = string(expiredBytes)
+			fake.mu.Unlock()
+
+			stExpired, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+			require.NoError(t, err)
+			assert.False(t, stExpired.Authenticated)
+			assert.True(t, stExpired.ExpiresAt.IsZero())
+			assert.Equal(t, "expired or revoked", stExpired.Reason)
+
+			_, tokErr := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "openid"})
+			require.ErrorIs(t, tokErr, ErrNotAuthenticated)
+
+			// 3. After PurgeExpiredTokens removes the expired cached access token, GetStatus stays unauthenticated.
+			purged, err := p.PurgeExpiredTokens(context.Background(), HandlerName)
+			require.NoError(t, err)
+			assert.Equal(t, 1, purged)
+
+			stPurged, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+			require.NoError(t, err)
+			assert.False(t, stPurged.Authenticated)
+			assert.Equal(t, "expired or revoked", stPurged.Reason)
+		})
+	}
+}
+
+func TestImpersonation_SourceIdentityCapturedBeforeExchange(t *testing.T) {
+	const targetSA = "target@proj.iam.gserviceaccount.com"
+	const testScope = "https://www.googleapis.com/auth/cloud-platform"
+
+	t.Run("gcloud ADC file switch during source exchange does not poison second account impersonation cache", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		gcloudDir := t.TempDir()
+		t.Setenv(EnvCloudSDKConfig, gcloudDir)
+		adcPath := filepath.Join(gcloudDir, "application_default_credentials.json")
+
+		writeADC := func(clientID, refreshToken string) {
+			raw, err := json.Marshal(GcloudADCCredentials{
+				Type:         "authorized_user",
+				ClientID:     clientID,
+				ClientSecret: "secret-" + clientID,
+				RefreshToken: refreshToken,
+			})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(adcPath, raw, 0o600))
+		}
+		writeADC("adc-client-a", "rt-account-a")
+
+		p, _, _ := newTestPlugin(t)
+		p.config.ImpersonateServiceAccount = targetSA
+
+		var impCalls atomic.Int32
+		p.httpClient = &blockingHTTPClient{
+			onPost: func(_ context.Context, _ string, data url.Values) (*http.Response, error) {
+				rt := data.Get("refresh_token")
+				if rt == "rt-account-a" {
+					// Switch gcloud's ADC file to account B while A's source token exchange is in flight.
+					writeADC("adc-client-a", "rt-account-b")
+					return jsonHTTPResponse(http.StatusOK, TokenResponse{
+						AccessToken: "source-at-a",
+						TokenType:   "Bearer",
+						ExpiresIn:   3600,
+					}), nil
+				}
+				return jsonHTTPResponse(http.StatusOK, TokenResponse{
+					AccessToken: "source-at-b",
+					TokenType:   "Bearer",
+					ExpiresIn:   3600,
+				}), nil
+			},
+			onDo: func(_ context.Context, req *http.Request) (*http.Response, error) {
+				impCalls.Add(1)
+				authz := req.Header.Get("Authorization")
+				if authz == "Bearer source-at-a" {
+					return jsonHTTPResponse(http.StatusOK, ImpersonationResponse{
+						AccessToken: "imp-token-from-a",
+						ExpireTime:  time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+					}), nil
+				}
+				return jsonHTTPResponse(http.StatusOK, ImpersonationResponse{
+					AccessToken: "imp-token-from-b",
+					ExpireTime:  time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+				}), nil
+			},
+		}
+
+		tokA, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: testScope})
+		require.NoError(t, err)
+		assert.Equal(t, "imp-token-from-a", tokA.AccessToken)
+
+		tokB, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: testScope})
+		require.NoError(t, err)
+		assert.Equal(t, "imp-token-from-b", tokB.AccessToken, "account B must not reuse an impersonated token minted by account A")
+		assert.Equal(t, int32(2), impCalls.Load())
+	})
+
+	t.Run("service account key file switch during source exchange does not poison second SA impersonation cache", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		dir := t.TempDir()
+		saPath := filepath.Join(dir, "sa.json")
+		privPEM := generateTestRSAKey(t)
+		writeSA := func(email string) {
+			raw, err := json.Marshal(ServiceAccountKey{
+				Type:         "service_account",
+				ProjectID:    "proj",
+				PrivateKeyID: "kid",
+				PrivateKey:   privPEM,
+				ClientEmail:  email,
+				ClientID:     email,
+			})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(saPath, raw, 0o600))
+		}
+		writeSA("sa-a@proj.iam.gserviceaccount.com")
+
+		p, _, _ := newTestPlugin(t)
+		p.config.ServiceAccountKeyFile = saPath
+		p.config.ImpersonateServiceAccount = targetSA
+
+		var saMints atomic.Int32
+		p.httpClient = &blockingHTTPClient{
+			onPost: func(_ context.Context, _ string, _ url.Values) (*http.Response, error) {
+				n := saMints.Add(1)
+				if n == 1 {
+					writeSA("sa-b@proj.iam.gserviceaccount.com")
+					return jsonHTTPResponse(http.StatusOK, TokenResponse{
+						AccessToken: "sa-source-a",
+						TokenType:   "Bearer",
+						ExpiresIn:   3600,
+					}), nil
+				}
+				return jsonHTTPResponse(http.StatusOK, TokenResponse{
+					AccessToken: "sa-source-b",
+					TokenType:   "Bearer",
+					ExpiresIn:   3600,
+				}), nil
+			},
+			onDo: func(_ context.Context, req *http.Request) (*http.Response, error) {
+				if req.Header.Get("Authorization") == "Bearer sa-source-a" {
+					return jsonHTTPResponse(http.StatusOK, ImpersonationResponse{
+						AccessToken: "imp-sa-a",
+						ExpireTime:  time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+					}), nil
+				}
+				return jsonHTTPResponse(http.StatusOK, ImpersonationResponse{
+					AccessToken: "imp-sa-b",
+					ExpireTime:  time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+				}), nil
+			},
+		}
+
+		tokA, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: testScope})
+		require.NoError(t, err)
+		assert.Equal(t, "imp-sa-a", tokA.AccessToken)
+
+		tokB, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: testScope})
+		require.NoError(t, err)
+		assert.Equal(t, "imp-sa-b", tokB.AccessToken)
+	})
+
+	t.Run("workload identity config switch during STS exchange does not poison second pool impersonation cache", func(t *testing.T) {
+		clearAmbientGCPEnv(t)
+
+		dir := t.TempDir()
+		subjFile := filepath.Join(dir, "subj.jwt")
+		require.NoError(t, os.WriteFile(subjFile, []byte("jwt-token"), 0o600))
+		wifPath := filepath.Join(dir, "wif.json")
+		writeWIF := func(audience string) {
+			raw, err := json.Marshal(ExternalAccountConfig{
+				Type:             "external_account",
+				Audience:         audience,
+				SubjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
+				CredentialSource: CredentialSource{File: subjFile},
+			})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(wifPath, raw, 0o600))
+		}
+		writeWIF("//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/pool-a/providers/p")
+
+		p, _, _ := newTestPlugin(t)
+		p.config.ExternalAccountFile = wifPath
+		p.config.ImpersonateServiceAccount = targetSA
+
+		p.httpClient = &blockingHTTPClient{
+			onPost: func(_ context.Context, _ string, data url.Values) (*http.Response, error) {
+				if strings.Contains(data.Get("audience"), "pool-a") {
+					writeWIF("//iam.googleapis.com/projects/2/locations/global/workloadIdentityPools/pool-b/providers/p")
+					return jsonHTTPResponse(http.StatusOK, STSTokenResponse{
+						AccessToken: "wi-source-a",
+						TokenType:   "Bearer",
+						ExpiresIn:   3600,
+					}), nil
+				}
+				return jsonHTTPResponse(http.StatusOK, STSTokenResponse{
+					AccessToken: "wi-source-b",
+					TokenType:   "Bearer",
+					ExpiresIn:   3600,
+				}), nil
+			},
+			onDo: func(_ context.Context, req *http.Request) (*http.Response, error) {
+				if req.Header.Get("Authorization") == "Bearer wi-source-a" {
+					return jsonHTTPResponse(http.StatusOK, ImpersonationResponse{
+						AccessToken: "imp-wi-a",
+						ExpireTime:  time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+					}), nil
+				}
+				return jsonHTTPResponse(http.StatusOK, ImpersonationResponse{
+					AccessToken: "imp-wi-b",
+					ExpireTime:  time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+				}), nil
+			},
+		}
+
+		tokA, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: testScope})
+		require.NoError(t, err)
+		assert.Equal(t, "imp-wi-a", tokA.AccessToken)
+
+		tokB, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: testScope})
+		require.NoError(t, err)
+		assert.Equal(t, "imp-wi-b", tokB.AccessToken)
+	})
+}
+
+func TestTransactionalLoginCommits_SeedSnapshotAndCancellation(t *testing.T) {
+	clearAmbientGCPEnv(t)
+
+	aliceJWT := makeTestIDToken(map[string]any{"sub": "alice-sub", "email": "alice@example.com"})
+	bobJWT := makeTestIDToken(map[string]any{"sub": "bob-sub", "email": "bob@example.com"})
+
+	t.Run("refresh-token-less interactive and device-code logins fail and preserve prior session and cache when seed write fails", func(t *testing.T) {
+		for _, lostAck := range []bool{false, true} {
+			for _, flow := range []auth.Flow{auth.FlowInteractive, auth.FlowDeviceCode} {
+				t.Run(fmt.Sprintf("%s_lostAck=%v", flow, lostAck), func(t *testing.T) {
+					p, fake, mockHTTP := newTestPlugin(t)
+					_, wantFailure := configureCustomCallbackPages(t, p)
+
+					// Establish Alice's session + cached access token + an extra cached entry.
+					mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+						AccessToken:  "alice-seeded-at",
+						RefreshToken: "alice-rt",
+						TokenType:    "Bearer",
+						ExpiresIn:    3600,
+						IDToken:      aliceJWT,
+					})
+					p.openBrowser = func(_ context.Context, authURL string) error {
+						completeLoopbackCallback(t, authURL, "ALICE-INIT")
+						return nil
+					}
+					_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+					require.NoError(t, err)
+
+					aliceMeta, err := p.loadMetadata(context.Background())
+					require.NoError(t, err)
+					extraCacheKey := SecretKeyTokenPrefix + "extra-impersonated-entry"
+					extraBytes, _ := json.Marshal(tokenCacheEntry{
+						AccessToken: "alice-extra-at",
+						TokenType:   "Bearer",
+						ExpiresAt:   time.Now().Add(time.Hour),
+						CachedAt:    time.Now(),
+						Flow:        auth.FlowInteractive,
+						SessionID:   aliceMeta.SessionID,
+					})
+					fake.mu.Lock()
+					fake.secrets[extraCacheKey] = string(extraBytes)
+					fake.mu.Unlock()
+
+					targetSeedKey := SecretKeyTokenPrefix + buildCacheKey(flow, fingerprintHash(DefaultADCClientID), "")
+					var failedOnce atomic.Bool
+					fake.mu.Lock()
+					fake.setSecretFunc = func(_ context.Context, name, value string) error {
+						if name == targetSeedKey && failedOnce.CompareAndSwap(false, true) {
+							if lostAck {
+								fake.mu.Lock()
+								fake.secrets[name] = value
+								fake.mu.Unlock()
+							}
+							return errors.New("seed storage quota exceeded")
+						}
+						return nil
+					}
+					fake.mu.Unlock()
+
+					browserStatusCh := make(chan int, 1)
+					browserBodyCh := make(chan string, 1)
+					if flow == auth.FlowInteractive {
+						mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+							AccessToken: "bob-nort-at",
+							TokenType:   "Bearer",
+							ExpiresIn:   900,
+							IDToken:     bobJWT,
+						})
+						p.openBrowser = func(_ context.Context, authURL string) error {
+							u, _ := url.Parse(authURL)
+							go func() {
+								resp, getErr := http.Get(u.Query().Get("redirect_uri") + "/?code=BOB-NORT&state=" + url.QueryEscape(u.Query().Get("state"))) //nolint:noctx
+								if getErr != nil {
+									browserStatusCh <- 0
+									browserBodyCh <- ""
+									return
+								}
+								b, _ := io.ReadAll(resp.Body)
+								_ = resp.Body.Close()
+								browserStatusCh <- resp.StatusCode
+								browserBodyCh <- string(b)
+							}()
+							return nil
+						}
+					} else {
+						mockHTTP.AddResponse(http.StatusOK, DeviceCodeResponse{
+							DeviceCode:      "dc-bob",
+							UserCode:        "UC-BOB",
+							VerificationURL: "https://accounts.google.com/device",
+							ExpiresIn:       300,
+							Interval:        1,
+						})
+						mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+							AccessToken: "bob-nort-at",
+							TokenType:   "Bearer",
+							ExpiresIn:   900,
+							IDToken:     bobJWT,
+						})
+					}
+
+					_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: flow}, nil)
+					require.Error(t, err)
+					assert.Contains(t, err.Error(), "failed to seed initial access token")
+					if flow == auth.FlowInteractive {
+						assert.Equal(t, http.StatusServiceUnavailable, <-browserStatusCh)
+						assert.Equal(t, wantFailure, <-browserBodyCh)
+					}
+
+					fake.mu.Lock()
+					fake.setSecretFunc = nil
+					_, hasExtra := fake.secrets[extraCacheKey]
+					fake.mu.Unlock()
+					assert.True(t, hasExtra, "prior cached tokens must not be cleared when replacement login fails")
+
+					// Alice's session and cached access token remain active without extra HTTP calls.
+					reqsBefore := len(mockHTTP.GetRequests())
+					st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+					require.NoError(t, err)
+					require.True(t, st.Authenticated)
+					assert.Equal(t, "alice@example.com", st.Claims.Email)
+
+					tok, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "openid"})
+					require.NoError(t, err)
+					assert.Equal(t, "alice-seeded-at", tok.AccessToken)
+					assert.Len(t, mockHTTP.GetRequests(), reqsBefore)
+				})
+			}
+		}
+	})
+
+	t.Run("snapshot GetSecret failure aborts before writing credentials in both storeCredentialsAndSeedToken and storeMetadataAndSeedToken", func(t *testing.T) {
+		p, fake, mockHTTP := newTestPlugin(t)
+
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at",
+			RefreshToken: "alice-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      aliceJWT,
+		})
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			completeLoopbackCallback(t, authURL, "ALICE-SNAP")
+			return nil
+		}
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.NoError(t, err)
+
+		var writesAttempted atomic.Int32
+		fake.mu.Lock()
+		fake.getSecretFunc = func(_ context.Context, name string) error {
+			if name == SecretKeyMetadata {
+				return errors.New("secret backend unavailable")
+			}
+			return nil
+		}
+		fake.setSecretFunc = func(_ context.Context, name, value string) error {
+			writesAttempted.Add(1)
+			fake.mu.Lock()
+			fake.secrets[name] = value
+			fake.mu.Unlock()
+			return errors.New("lost ack write")
+		}
+		fake.mu.Unlock()
+
+		_, err = p.storeCredentialsAndSeedToken(
+			context.Background(),
+			DefaultConfig(),
+			&TokenResponse{AccessToken: "bob-at", RefreshToken: "bob-rt", ExpiresIn: 3600, IDToken: bobJWT},
+			auth.FlowInteractive,
+			[]string{"openid"},
+			"",
+			DefaultADCClientID,
+			nil,
+			buildCacheKey(auth.FlowInteractive, fingerprintHash(DefaultADCClientID), ""),
+			&auth.Token{AccessToken: "bob-at", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour), Flow: auth.FlowInteractive},
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "reading previous session metadata")
+		assert.Equal(t, int32(0), writesAttempted.Load(), "must abort before writing any secrets when snapshot read fails")
+
+		_, err = p.storeMetadataAndSeedToken(
+			context.Background(),
+			&auth.Claims{Issuer: "https://accounts.google.com", Subject: "sa@proj.iam.gserviceaccount.com", Email: "sa@proj.iam.gserviceaccount.com"},
+			auth.FlowServicePrincipal,
+			[]string{"cloud-platform"},
+			buildCacheKey(auth.FlowServicePrincipal, fingerprintHash("sa@proj.iam.gserviceaccount.com"), "cloud-platform"),
+			&auth.Token{AccessToken: "sa-at", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour), Flow: auth.FlowServicePrincipal},
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "reading previous session metadata")
+		assert.Equal(t, int32(0), writesAttempted.Load(), "storeMetadataAndSeedToken must abort before writing any secrets when snapshot read fails")
+
+		fake.mu.Lock()
+		fake.getSecretFunc = nil
+		fake.setSecretFunc = nil
+		fake.mu.Unlock()
+
+		st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		require.True(t, st.Authenticated)
+		assert.Equal(t, "alice@example.com", st.Claims.Email)
+	})
+
+	t.Run("cancellation during detached legacy-mirror write settles 503 FailureHTML, returns ErrUserCancelled, and rolls back to prior session", func(t *testing.T) {
+		p, fake, mockHTTP := newTestPlugin(t)
+		_, wantFailure := configureCustomCallbackPages(t, p)
+
+		// 1. Alice logs in first.
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "alice-at-1",
+			RefreshToken: "alice-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      aliceJWT,
+		})
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken:  "bob-at-1",
+			RefreshToken: "bob-rt",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			IDToken:      bobJWT,
+		})
+		mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+			AccessToken: "alice-at-refreshed",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			completeLoopbackCallback(t, authURL, "ALICE-OK")
+			return nil
+		}
+		_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.NoError(t, err)
+
+		// 2. Bob starts Login; cancel Bob's context right inside the detached legacy-mirror SetSecret!
+		loginCtx, cancelLogin := context.WithCancel(context.Background())
+		defer cancelLogin()
+
+		var cancelledInMirror atomic.Bool
+		fake.mu.Lock()
+		fake.setSecretFunc = func(_ context.Context, name, _ string) error {
+			if name == SecretKeyRefreshToken && cancelledInMirror.CompareAndSwap(false, true) {
+				cancelLogin()
+			}
+			return nil
+		}
+		fake.mu.Unlock()
+
+		browserStatusCh := make(chan int, 1)
+		browserBodyCh := make(chan string, 1)
+		p.openBrowser = func(_ context.Context, authURL string) error {
+			u, _ := url.Parse(authURL)
+			go func() {
+				resp, getErr := http.Get(u.Query().Get("redirect_uri") + "/?code=BOB-CANCEL-MIRROR&state=" + url.QueryEscape(u.Query().Get("state"))) //nolint:noctx
+				if getErr != nil {
+					browserStatusCh <- 0
+					browserBodyCh <- ""
+					return
+				}
+				b, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				browserStatusCh <- resp.StatusCode
+				browserBodyCh <- string(b)
+			}()
+			return nil
+		}
+
+		_, err = p.Login(loginCtx, HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+		require.ErrorIs(t, err, ErrUserCancelled)
+		assert.True(t, cancelledInMirror.Load())
+		assert.Equal(t, http.StatusServiceUnavailable, <-browserStatusCh)
+		assert.Equal(t, wantFailure, <-browserBodyCh)
+
+		fake.mu.Lock()
+		fake.setSecretFunc = nil
+		legacyVal := fake.secrets[SecretKeyRefreshToken]
+		var versionedKeys []string
+		for k, v := range fake.secrets {
+			if strings.HasPrefix(k, SecretKeyRefreshToken+".") {
+				versionedKeys = append(versionedKeys, v)
+			}
+		}
+		fake.mu.Unlock()
+		assert.Equal(t, "alice-rt", legacyVal, "legacy refresh token mirror must roll back to Alice's token")
+		assert.Equal(t, []string{"alice-rt"}, versionedKeys, "Bob's unreferenced versioned refresh token must be cleaned up while keeping Alice's")
+
+		// Alice's session, cached access token, and refresh token all remain intact.
+		st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		require.True(t, st.Authenticated)
+		assert.Equal(t, "alice@example.com", st.Claims.Email)
+
+		cachedTok, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "openid"})
+		require.NoError(t, err)
+		assert.Equal(t, "alice-at-1", cachedTok.AccessToken)
+
+		refreshedTok, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope:        "openid",
+			ForceRefresh: true,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "alice-at-refreshed", refreshedTok.AccessToken)
+		assert.Equal(t, "alice-rt", mockHTTP.GetRequests()[2].Data.Get("refresh_token"))
+	})
+
+	t.Run("refresh-token-less interactive and device-code logins reject missing zero negative or sub-threshold expires_in before writing", func(t *testing.T) {
+		for _, expiresIn := range []int{0, -60, 60} {
+			for _, flow := range []auth.Flow{auth.FlowInteractive, auth.FlowDeviceCode} {
+				t.Run(fmt.Sprintf("%s_expiresIn=%d", flow, expiresIn), func(t *testing.T) {
+					p, fake, mockHTTP := newTestPlugin(t)
+					_, wantFailure := configureCustomCallbackPages(t, p)
+
+					// Establish Alice's session first.
+					mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+						AccessToken:  "alice-valid-at",
+						RefreshToken: "alice-rt",
+						TokenType:    "Bearer",
+						ExpiresIn:    3600,
+						IDToken:      aliceJWT,
+					})
+					p.openBrowser = func(_ context.Context, authURL string) error {
+						completeLoopbackCallback(t, authURL, "ALICE-EXP-INIT")
+						return nil
+					}
+					_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+					require.NoError(t, err)
+
+					var writesAttempted atomic.Int32
+					fake.mu.Lock()
+					fake.setSecretFunc = func(_ context.Context, _, _ string) error {
+						writesAttempted.Add(1)
+						return nil
+					}
+					fake.mu.Unlock()
+
+					browserStatusCh := make(chan int, 1)
+					browserBodyCh := make(chan string, 1)
+					if flow == auth.FlowInteractive {
+						mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+							AccessToken: "bob-expired-at",
+							TokenType:   "Bearer",
+							ExpiresIn:   expiresIn,
+							IDToken:     bobJWT,
+						})
+						p.openBrowser = func(_ context.Context, authURL string) error {
+							u, _ := url.Parse(authURL)
+							go func() {
+								resp, getErr := http.Get(u.Query().Get("redirect_uri") + "/?code=BOB-EXP&state=" + url.QueryEscape(u.Query().Get("state"))) //nolint:noctx
+								if getErr != nil {
+									browserStatusCh <- 0
+									browserBodyCh <- ""
+									return
+								}
+								b, _ := io.ReadAll(resp.Body)
+								_ = resp.Body.Close()
+								browserStatusCh <- resp.StatusCode
+								browserBodyCh <- string(b)
+							}()
+							return nil
+						}
+					} else {
+						mockHTTP.AddResponse(http.StatusOK, DeviceCodeResponse{
+							DeviceCode:      "dc-exp",
+							UserCode:        "UC-EXP",
+							VerificationURL: "https://accounts.google.com/device",
+							ExpiresIn:       300,
+							Interval:        1,
+						})
+						mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+							AccessToken: "bob-expired-at",
+							TokenType:   "Bearer",
+							ExpiresIn:   expiresIn,
+							IDToken:     bobJWT,
+						})
+					}
+
+					_, err = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: flow}, nil)
+					require.Error(t, err)
+					assert.Contains(t, err.Error(), "initial access token lifetime does not satisfy minimum validity")
+					assert.Equal(t, int32(0), writesAttempted.Load(), "must reject invalid initial lifetime before any secret writes")
+					if flow == auth.FlowInteractive {
+						assert.Equal(t, http.StatusServiceUnavailable, <-browserStatusCh)
+						assert.Equal(t, wantFailure, <-browserBodyCh)
+					}
+
+					st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+					require.NoError(t, err)
+					require.True(t, st.Authenticated)
+					assert.Equal(t, "alice@example.com", st.Claims.Email)
+				})
+			}
+		}
+	})
+
+	t.Run("panic during credential staging rolls back to prior session, settles 503 FailureHTML, and preserves panic across both staging branches", func(t *testing.T) {
+		seedKey := SecretKeyTokenPrefix + buildCacheKey(auth.FlowInteractive, fingerprintHash(DefaultADCClientID), "")
+		cases := []struct {
+			name        string
+			withRefresh bool
+			panicKey    string
+		}{
+			{
+				name:        "with_refresh_panic_after_metadata_on_legacy_mirror",
+				withRefresh: true,
+				panicKey:    SecretKeyRefreshToken,
+			},
+			{
+				name:        "with_refresh_panic_after_access_token_seed",
+				withRefresh: true,
+				panicKey:    seedKey,
+			},
+			{
+				name:        "no_refresh_panic_after_access_token_seed",
+				withRefresh: false,
+				panicKey:    seedKey,
+			},
+			{
+				name:        "no_refresh_panic_after_metadata_commit",
+				withRefresh: false,
+				panicKey:    SecretKeyMetadata,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				p, fake, mockHTTP := newTestPlugin(t)
+				_, wantFailure := configureCustomCallbackPages(t, p)
+
+				mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+					AccessToken:  "alice-panic-at-1",
+					RefreshToken: "alice-panic-rt",
+					TokenType:    "Bearer",
+					ExpiresIn:    3600,
+					IDToken:      aliceJWT,
+				})
+				p.openBrowser = func(_ context.Context, authURL string) error {
+					completeLoopbackCallback(t, authURL, "ALICE-PANIC-BASE")
+					return nil
+				}
+				_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+				require.NoError(t, err)
+
+				bobResp := TokenResponse{
+					AccessToken: "bob-panic-at",
+					TokenType:   "Bearer",
+					ExpiresIn:   3600,
+					IDToken:     bobJWT,
+				}
+				if tc.withRefresh {
+					bobResp.RefreshToken = "bob-panic-rt"
+				}
+				mockHTTP.AddResponse(http.StatusOK, bobResp)
+				mockHTTP.AddResponse(http.StatusOK, TokenResponse{
+					AccessToken: "alice-panic-at-refreshed",
+					TokenType:   "Bearer",
+					ExpiresIn:   3600,
+				})
+
+				var panickedOnce atomic.Bool
+				fake.mu.Lock()
+				fake.setSecretFunc = func(_ context.Context, name, value string) error {
+					if name == tc.panicKey && panickedOnce.CompareAndSwap(false, true) {
+						fake.mu.Lock()
+						fake.secrets[name] = value
+						fake.mu.Unlock()
+						panic("simulated staging panic")
+					}
+					return nil
+				}
+				fake.mu.Unlock()
+
+				browserStatusCh := make(chan int, 1)
+				browserBodyCh := make(chan string, 1)
+				p.openBrowser = func(_ context.Context, authURL string) error {
+					u, _ := url.Parse(authURL)
+					go func() {
+						resp, getErr := http.Get(u.Query().Get("redirect_uri") + "/?code=BOB-PANIC-STAGE&state=" + url.QueryEscape(u.Query().Get("state"))) //nolint:noctx
+						if getErr != nil {
+							browserStatusCh <- 0
+							browserBodyCh <- ""
+							return
+						}
+						b, _ := io.ReadAll(resp.Body)
+						_ = resp.Body.Close()
+						browserStatusCh <- resp.StatusCode
+						browserBodyCh <- string(b)
+					}()
+					return nil
+				}
+
+				assert.PanicsWithValue(t, "simulated staging panic", func() {
+					_, _ = p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{Flow: auth.FlowInteractive}, nil)
+				})
+				assert.True(t, panickedOnce.Load())
+				assert.Equal(t, http.StatusServiceUnavailable, <-browserStatusCh)
+				assert.Equal(t, wantFailure, <-browserBodyCh)
+
+				fake.mu.Lock()
+				fake.setSecretFunc = nil
+				legacyVal := fake.secrets[SecretKeyRefreshToken]
+				var versionedVals []string
+				for k, v := range fake.secrets {
+					if strings.HasPrefix(k, SecretKeyRefreshToken+".") {
+						versionedVals = append(versionedVals, v)
+					}
+				}
+				fake.mu.Unlock()
+				assert.Equal(t, "alice-panic-rt", legacyVal)
+				assert.Equal(t, []string{"alice-panic-rt"}, versionedVals)
+
+				st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+				require.NoError(t, err)
+				require.True(t, st.Authenticated)
+				assert.Equal(t, "alice@example.com", st.Claims.Email)
+
+				cachedTok, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{Scope: "openid"})
+				require.NoError(t, err)
+				assert.Equal(t, "alice-panic-at-1", cachedTok.AccessToken)
+
+				refreshedTok, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+					Scope:        "openid",
+					ForceRefresh: true,
+				})
+				require.NoError(t, err)
+				assert.Equal(t, "alice-panic-at-refreshed", refreshedTok.AccessToken)
+				assert.Equal(t, "alice-panic-rt", mockHTTP.GetRequests()[2].Data.Get("refresh_token"))
+			})
+		}
+	})
+}
+
+type closableClientStub struct {
+	closed atomic.Int32
+}
+
+func (c *closableClientStub) Close() error {
+	c.closed.Add(1)
+	return nil
+}
+
+func TestBoundedClientCache_CloseAllRejectsAndClosesInFlightBuilders(t *testing.T) {
+	cache := newBoundedClientCache[string, *closableClientStub](4)
+
+	existing := &closableClientStub{}
+	gotExisting, ok := cache.GetOrCreate("existing", func() *closableClientStub {
+		return existing
+	})
+	require.True(t, ok)
+	assert.Same(t, existing, gotExisting)
+	assert.Equal(t, 1, cache.Len())
+
+	inBuild := make(chan struct{})
+	releaseBuild := make(chan struct{})
+	pendingCandidate := &closableClientStub{}
+
+	type getResult struct {
+		val *closableClientStub
+		ok  bool
+	}
+	resCh := make(chan getResult, 1)
+	go func() {
+		v, createdOK := cache.GetOrCreate("pending", func() *closableClientStub {
+			close(inBuild)
+			<-releaseBuild
+			return pendingCandidate
+		})
+		resCh <- getResult{val: v, ok: createdOK}
+	}()
+
+	<-inBuild
+	cache.CloseAll()
+	assert.Equal(t, int32(1), existing.closed.Load(), "CloseAll must close existing cached entries immediately")
+	assert.Equal(t, 0, cache.Len())
+
+	// Unpause the pending builder after CloseAll has retired the cache.
+	close(releaseBuild)
+	res := <-resCh
+	assert.False(t, res.ok, "in-flight builder finishing after CloseAll must be rejected")
+	assert.Nil(t, res.val)
+	assert.Equal(t, int32(1), pendingCandidate.closed.Load(), "in-flight candidate must be closed rather than leaked")
+	assert.Equal(t, 0, cache.Len(), "retired cache must remain empty")
+
+	// Terminal closure: subsequent GetOrCreate calls neither invoke build nor insert.
+	var postCloseBuilds atomic.Int32
+	postVal, postOK := cache.GetOrCreate("after-close", func() *closableClientStub {
+		postCloseBuilds.Add(1)
+		return &closableClientStub{}
+	})
+	assert.False(t, postOK)
+	assert.Nil(t, postVal)
+	assert.Equal(t, int32(0), postCloseBuilds.Load())
+	assert.Equal(t, 0, cache.Len())
 }

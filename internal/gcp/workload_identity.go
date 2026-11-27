@@ -72,7 +72,7 @@ func getExternalAccountConfigFromPath(path string, explicit bool) (*ExternalAcco
 		return nil, ErrNoWorkloadIdentityConfigured
 	}
 
-	data, err := os.ReadFile(path) //nolint:gosec // G304/G703: path from operator config or GOOGLE_EXTERNAL_ACCOUNT
+	data, err := readCredentialFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading external account config: %w", err)
 	}
@@ -129,7 +129,7 @@ func workloadIdentityFingerprint(cfg *ExternalAccountConfig) string {
 // readSubjectToken reads the subject token from the credential source.
 func readSubjectToken(cfg *ExternalAccountConfig) (string, error) {
 	if cfg.CredentialSource.File != "" {
-		data, err := os.ReadFile(cfg.CredentialSource.File)
+		data, err := readCredentialFile(cfg.CredentialSource.File)
 		if err != nil {
 			return "", fmt.Errorf("reading subject token file: %w", err)
 		}
@@ -160,8 +160,8 @@ func readSubjectToken(cfg *ExternalAccountConfig) (string, error) {
 
 	if cfg.CredentialSource.URL != "" {
 		return "", fmt.Errorf(
-			"unsupported credential source in external account config: "+
-				"URL-based credential sources are not yet supported. "+
+			"unsupported credential source in external account config: " +
+				"URL-based credential sources are not yet supported. " +
 				"Only file-based credential sources are supported")
 	}
 
@@ -311,12 +311,6 @@ func (p *Plugin) getWorkloadIdentityToken(ctx context.Context, scope string, for
 }
 
 func (p *Plugin) getWorkloadIdentityTokenWithMinValidFor(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
-	lgr := logr.FromContextOrDiscard(ctx)
-
-	if minValidFor <= 0 {
-		minValidFor = DefaultMinValidFor
-	}
-
 	handlerCfg, err := p.effectiveConfig(ctx)
 	if err != nil {
 		return nil, err
@@ -329,6 +323,16 @@ func (p *Plugin) getWorkloadIdentityTokenWithMinValidFor(ctx context.Context, sc
 			return nil, ErrNotAuthenticated
 		}
 		return nil, fmt.Errorf("workload identity credentials error: %w", err)
+	}
+
+	return p.getWorkloadIdentityTokenForParsed(ctx, extCfg, scope, forceRefresh, minValidFor)
+}
+
+func (p *Plugin) getWorkloadIdentityTokenForParsed(ctx context.Context, extCfg *ExternalAccountConfig, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
+	lgr := logr.FromContextOrDiscard(ctx)
+
+	if minValidFor <= 0 {
+		minValidFor = DefaultMinValidFor
 	}
 
 	fingerprint := workloadIdentityFingerprint(extCfg)
@@ -344,6 +348,9 @@ func (p *Plugin) getWorkloadIdentityTokenWithMinValidFor(ctx context.Context, sc
 				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
 					if cached.Flow == "" {
 						cached.Flow = auth.FlowWorkloadIdentity
+					}
+					if cached.SessionID == "" && sessionID != "" {
+						cached.SessionID = sessionID
 					}
 					lgr.V(1).Info("using cached WI token", "scope", scope)
 					return cached, nil
@@ -395,7 +402,7 @@ func (p *Plugin) workloadIdentityStatusFromParsed(handlerCfg *Config, cfg *Exter
 
 	// Verify credential source is accessible before reporting authenticated
 	if tokenFile != "" {
-		if _, err := os.Stat(tokenFile); err != nil {
+		if _, err := statCredentialFile(tokenFile); err != nil {
 			return &auth.Status{
 				Authenticated: false,
 				Flow:          auth.FlowWorkloadIdentity,
