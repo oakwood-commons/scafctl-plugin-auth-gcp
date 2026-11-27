@@ -135,23 +135,14 @@ func (p *Plugin) impersonateServiceAccount(ctx context.Context, sourceToken, tar
 
 // getImpersonatedToken acquires a token for the impersonated service account.
 func (p *Plugin) getImpersonatedToken(ctx context.Context, sourceAccessToken, scope string, forceRefresh bool) (*auth.Token, error) {
-	return p.getImpersonatedTokenWithSource(ctx, &auth.Token{AccessToken: sourceAccessToken}, scope, forceRefresh, DefaultMinValidFor)
+	return p.getImpersonatedTokenWithSource(ctx, &auth.Token{AccessToken: sourceAccessToken}, "", scope, forceRefresh, DefaultMinValidFor)
 }
 
-func (p *Plugin) impersonationSourceIdentity(cfg *Config, flow auth.Flow, matchedMetadata *TokenMetadata) string {
-	switch flow { //nolint:exhaustive // only credential-file/OAuth client flows need extra disambiguation
-	case auth.FlowServicePrincipal:
-		if key, err := p.getServiceAccountKeyForConfig(cfg); err == nil && key != nil {
-			return key.ClientEmail
-		}
-	case auth.FlowWorkloadIdentity:
-		if extCfg, err := p.getExternalAccountConfigForConfig(cfg); err == nil && extCfg != nil {
-			return workloadIdentityFingerprint(extCfg)
-		}
-	case auth.FlowGcloudADC:
-		if creds, err := LoadGcloudADCCredentials(); err == nil && creds != nil {
-			return creds.ClientID + "|" + fingerprintHash(creds.RefreshToken)
-		}
+func resolveImpersonationSourceIdentity(cfg *Config, flow auth.Flow, capturedIdentity string, matchedMetadata *TokenMetadata) string {
+	if capturedIdentity != "" {
+		return capturedIdentity
+	}
+	switch flow { //nolint:exhaustive // credential-file flows pass capturedIdentity directly without re-reading disk
 	case auth.FlowInteractive, auth.FlowDeviceCode:
 		if matchedMetadata != nil && matchedMetadata.ClientID != "" {
 			return matchedMetadata.ClientID
@@ -164,7 +155,7 @@ func (p *Plugin) impersonationSourceIdentity(cfg *Config, flow auth.Flow, matche
 	return ""
 }
 
-func (p *Plugin) getImpersonatedTokenWithSource(ctx context.Context, sourceToken *auth.Token, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
+func (p *Plugin) getImpersonatedTokenWithSource(ctx context.Context, sourceToken *auth.Token, sourceIdentity string, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	cfg, err := p.effectiveConfig(ctx)
@@ -193,15 +184,10 @@ func (p *Plugin) getImpersonatedTokenWithSource(ctx context.Context, sourceToken
 		effectiveFlow = sourceToken.Flow
 		hasExplicitSourceFlow = sourceToken.Flow != ""
 	}
-	if metadata, metaErr := p.loadMetadata(ctx); metaErr == nil && metadata != nil {
-		// Only inherit stored metadata when sourceToken had no flow or matches
-		// the stored session's flow -- never attach an interactive session's ID
-		// to a per-RPC SA/WIF override token.
-		if !hasExplicitSourceFlow || metadata.Flow == effectiveFlow {
+	if !hasExplicitSourceFlow {
+		if metadata, metaErr := p.loadMetadata(ctx); metaErr == nil && metadata != nil {
 			matchedMetadata = metadata
-			if sessionID == "" && !hasExplicitSourceFlow {
-				sessionID = metadata.SessionID
-			} else if sessionID == "" && (effectiveFlow == auth.FlowInteractive || effectiveFlow == auth.FlowDeviceCode || effectiveFlow == auth.FlowMetadata || effectiveFlow == auth.FlowGcloudADC) {
+			if sessionID == "" {
 				sessionID = metadata.SessionID
 			}
 			if effectiveFlow == "" {
@@ -213,13 +199,14 @@ func (p *Plugin) getImpersonatedTokenWithSource(ctx context.Context, sourceToken
 		effectiveFlow = auth.FlowInteractive
 	}
 
-	// Partition impersonated token cache by target SA AND source identity/session
-	// (preserving targetSA-only fingerprint only for legacy direct getImpersonatedToken
+	// Partition impersonated token cache by target SA AND the immutable source
+	// identity/session captured at source-token acquisition time (preserving
+	// targetSA-only fingerprint only for legacy direct getImpersonatedToken
 	// helper calls where neither sourceToken.Flow nor stored metadata is present).
 	impersonateFingerprint := fingerprintHash(targetSA)
 	if hasExplicitSourceFlow || sessionID != "" {
 		impersonateFingerprint = fingerprintHash(
-			targetSA + "|" + string(effectiveFlow) + "|" + sessionID + "|" + p.impersonationSourceIdentity(cfg, effectiveFlow, matchedMetadata),
+			targetSA + "|" + string(effectiveFlow) + "|" + sessionID + "|" + resolveImpersonationSourceIdentity(cfg, effectiveFlow, sourceIdentity, matchedMetadata),
 		)
 	}
 

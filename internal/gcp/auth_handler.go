@@ -73,6 +73,7 @@ type Plugin struct {
 	openBrowser      BrowserOpenFunc
 
 	profileLocks   sync.Map
+	refreshLocks   sync.Map
 	cleanupTimeout time.Duration
 
 	clientCacheMu   sync.Mutex
@@ -94,6 +95,27 @@ func (p *Plugin) profileLock(ctx context.Context) *sync.RWMutex {
 	mu := &sync.RWMutex{}
 	actual, _ := p.profileLocks.LoadOrStore(profile, mu)
 	return actual.(*sync.RWMutex)
+}
+
+// acquireRefreshLock serializes refresh-token grant consumption per profile
+// across mintToken and validateStoredRefreshToken without holding profileLock
+// during HTTP requests. Lock acquisition order is always refreshLock -> profileLock.
+func (p *Plugin) acquireRefreshLock(ctx context.Context) (func(), error) {
+	profile := auth.ProfileFromContext(ctx)
+	var ch chan struct{}
+	if v, ok := p.refreshLocks.Load(profile); ok {
+		ch = v.(chan struct{})
+	} else {
+		candidate := make(chan struct{}, 1)
+		actual, _ := p.refreshLocks.LoadOrStore(profile, candidate)
+		ch = actual.(chan struct{})
+	}
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 type resolvedConfigKeyType struct{}
@@ -183,27 +205,39 @@ func (p *Plugin) httpClientForConfig(ctx context.Context, cfg *Config) (HTTPClie
 		return nil, fmt.Errorf("failed to build HTTP client from httpClient config: %w", err)
 	}
 
-	p.clientCacheMu.Lock()
-	curHTTP := p.httpClient
-	hasInit := p.hasInitHTTPKey
-	initKey := p.initHTTPKey
-	baseLgr := p.baseLogger
-	if curHTTP != nil {
-		if _, isDefault := curHTTP.(*DefaultHTTPClient); !isDefault {
-			p.clientCacheMu.Unlock()
-			return curHTTP, nil
+	for {
+		p.clientCacheMu.Lock()
+		curHTTP := p.httpClient
+		hasInit := p.hasInitHTTPKey
+		initKey := p.initHTTPKey
+		baseLgr := p.baseLogger
+		if curHTTP != nil {
+			if _, isDefault := curHTTP.(*DefaultHTTPClient); !isDefault {
+				p.clientCacheMu.Unlock()
+				return curHTTP, nil
+			}
+			if hasInit && key == initKey {
+				p.clientCacheMu.Unlock()
+				return curHTTP, nil
+			}
 		}
-		if hasInit && key == initKey {
-			p.clientCacheMu.Unlock()
-			return curHTTP, nil
+		cache := p.ensureHTTPClientCacheLocked()
+		p.clientCacheMu.Unlock()
+
+		client, ok := cache.GetOrCreate(key, func() *DefaultHTTPClient {
+			return newDefaultHTTPClientFromResolved(clientCfg, pickHTTPLogger(ctx, baseLgr))
+		})
+		if ok {
+			return client, nil
+		}
+
+		p.clientCacheMu.Lock()
+		hasReplacementCache := p.httpClientCache != nil && p.httpClientCache != cache
+		p.clientCacheMu.Unlock()
+		if !hasReplacementCache {
+			return nil, fmt.Errorf("HTTP client cache closed during request")
 		}
 	}
-	cache := p.ensureHTTPClientCacheLocked()
-	p.clientCacheMu.Unlock()
-
-	return cache.GetOrCreate(key, func() *DefaultHTTPClient {
-		return newDefaultHTTPClientFromResolved(clientCfg, pickHTTPLogger(ctx, baseLgr))
-	}), nil
 }
 
 func (p *Plugin) closeHTTPClients() {
@@ -605,7 +639,7 @@ func (p *Plugin) GetStatus(ctx context.Context, handlerName string, req sdkplugi
 	}
 
 	// 3. Stored credentials in this profile
-	metadata, refreshToken, hasRefresh, credErr := p.inspectStoredMetadataAndRefresh(ctx)
+	metadata, _, hasRefresh, credErr := p.inspectStoredMetadataAndRefresh(ctx)
 	if credErr != nil {
 		if errors.Is(credErr, errMetadataNotFound) {
 			// 4. Ambient GCE/GKE metadata server
@@ -692,7 +726,7 @@ func (p *Plugin) GetStatus(ctx context.Context, handlerName string, req sdkplugi
 	// probing tokenEndpoint without deleting credentials or caching access tokens;
 	// any rotated refresh token is persisted so the session stays valid).
 	if hasRefresh {
-		if tokenErr := p.validateStoredRefreshToken(ctx, cfg, metadata, refreshToken); tokenErr != nil {
+		if tokenErr := p.validateStoredRefreshToken(ctx, cfg, metadata); tokenErr != nil {
 			status.Authenticated = false
 			errMsg := tokenErr.Error()
 			switch {
@@ -704,6 +738,19 @@ func (p *Plugin) GetStatus(ctx context.Context, handlerName string, req sdkplugi
 			default:
 				status.Reason = "token refresh failed"
 			}
+		}
+	} else if isRefreshTokenFlow(metadata.Flow) {
+		cached, tokenErr := p.findUsableCachedUserToken(ctx, metadata)
+		if tokenErr != nil {
+			status.Authenticated = false
+			status.ExpiresAt = time.Time{}
+			if errors.Is(tokenErr, ErrNotAuthenticated) {
+				status.Reason = "expired or revoked"
+			} else {
+				status.Reason = "failed to inspect cached access token"
+			}
+		} else {
+			status.ExpiresAt = cached.ExpiresAt
 		}
 	} else if metadata.Flow == auth.FlowGcloudADC {
 		if tokenErr := p.validateGcloudADCCredentials(ctx); tokenErr != nil {
@@ -770,16 +817,19 @@ func (p *Plugin) resolveAndAcquireTokenWithMinValidFor(ctx context.Context, scop
 	}
 	ctx = withResolvedConfig(ctx, cfg)
 
-	// If impersonation is configured, get a source token first then impersonate
-	if cfg.ImpersonateServiceAccount != "" {
-		sourceToken, err := p.acquireSourceTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
-		if err != nil {
+	sourceToken, sourceIdentity, err := p.acquireSourceTokenWithIdentity(ctx, scope, forceRefresh, minValidFor)
+	if err != nil {
+		if cfg.ImpersonateServiceAccount != "" {
 			return nil, fmt.Errorf("acquiring source token for impersonation: %w", err)
 		}
-		return p.getImpersonatedTokenWithSource(ctx, sourceToken, scope, forceRefresh, minValidFor)
+		return nil, err
 	}
 
-	return p.acquireSourceTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+	if cfg.ImpersonateServiceAccount != "" {
+		return p.getImpersonatedTokenWithSource(ctx, sourceToken, sourceIdentity, scope, forceRefresh, minValidFor)
+	}
+
+	return sourceToken, nil
 }
 
 // acquireSourceToken determines the appropriate credential source and acquires a token.
@@ -788,24 +838,37 @@ func (p *Plugin) acquireSourceToken(ctx context.Context, scope string, forceRefr
 }
 
 func (p *Plugin) acquireSourceTokenWithMinValidFor(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
+	token, _, err := p.acquireSourceTokenWithIdentity(ctx, scope, forceRefresh, minValidFor)
+	return token, err
+}
+
+func (p *Plugin) acquireSourceTokenWithIdentity(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, string, error) {
 	cfg, err := p.effectiveConfig(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	ctx = withResolvedConfig(ctx, cfg)
 
 	// 1. Workload identity (highest priority; fail closed on invalid explicit/configured file)
-	if _, wiErr := p.getExternalAccountConfigForConfig(cfg); wiErr == nil {
-		return p.getWorkloadIdentityTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+	if extCfg, wiErr := p.getExternalAccountConfigForConfig(cfg); wiErr == nil {
+		token, tokenErr := p.getWorkloadIdentityTokenForParsed(ctx, extCfg, scope, forceRefresh, minValidFor)
+		if tokenErr != nil {
+			return nil, "", tokenErr
+		}
+		return token, workloadIdentityFingerprint(extCfg), nil
 	} else if !errors.Is(wiErr, ErrNoWorkloadIdentityConfigured) {
-		return nil, fmt.Errorf("workload identity credentials error: %w", wiErr)
+		return nil, "", fmt.Errorf("workload identity credentials error: %w", wiErr)
 	}
 
 	// 2. Service account key (fail closed on invalid explicit/configured file)
-	if _, saErr := p.getServiceAccountKeyForConfig(cfg); saErr == nil {
-		return p.getServiceAccountTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+	if saKey, saErr := p.getServiceAccountKeyForConfig(cfg); saErr == nil {
+		token, tokenErr := p.getServiceAccountTokenForKey(ctx, saKey, scope, forceRefresh, minValidFor)
+		if tokenErr != nil {
+			return nil, "", tokenErr
+		}
+		return token, saKey.ClientEmail, nil
 	} else if !errors.Is(saErr, ErrNoServiceAccountConfigured) {
-		return nil, fmt.Errorf("service account credentials error: %w", saErr)
+		return nil, "", fmt.Errorf("service account credentials error: %w", saErr)
 	}
 
 	// 3. Stored profile session (metadata, gcloud_adc, interactive, device_code).
@@ -816,30 +879,36 @@ func (p *Plugin) acquireSourceTokenWithMinValidFor(ctx context.Context, scope st
 		if credErr == nil && metadata != nil {
 			switch {
 			case metadata.Flow == auth.FlowMetadata:
-				return p.getMetadataTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+				token, tokenErr := p.getMetadataTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+				return token, "", tokenErr
 			case metadata.Flow == auth.FlowGcloudADC:
-				return p.getGcloudADCTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+				return p.getGcloudADCTokenWithIdentity(ctx, scope, forceRefresh, minValidFor)
 			case hasRefresh || metadata.Flow == auth.FlowInteractive || metadata.Flow == auth.FlowDeviceCode:
-				return p.getStoredRefreshTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+				return p.getStoredRefreshTokenWithIdentity(ctx, scope, forceRefresh, minValidFor)
 			default:
-				return nil, ErrNotAuthenticated
+				return nil, "", ErrNotAuthenticated
 			}
 		} else if credErr != nil && !errors.Is(credErr, errMetadataNotFound) {
-			return nil, fmt.Errorf("%w: %w", ErrNotAuthenticated, credErr)
+			return nil, "", fmt.Errorf("%w: %w", ErrNotAuthenticated, credErr)
 		}
 	}
 
 	// 4. Ambient GCE/GKE metadata server
 	if p.isMetadataServerAvailable(ctx) {
-		return p.getMetadataTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+		token, tokenErr := p.getMetadataTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+		return token, "", tokenErr
 	}
 
-	// 5. Ambient gcloud ADC fallback
-	if HasGcloudADCCredentials() {
-		return p.getGcloudADCTokenWithMinValidFor(ctx, scope, forceRefresh, minValidFor)
+	// 5. Ambient gcloud ADC fallback (load credentials once so source identity is fixed before network I/O)
+	if creds, adcErr := LoadGcloudADCCredentials(); adcErr == nil {
+		token, tokenErr := p.getGcloudADCTokenForCreds(ctx, creds, scope, forceRefresh, minValidFor)
+		if tokenErr != nil {
+			return nil, "", tokenErr
+		}
+		return token, gcloudADCSourceIdentity(creds), nil
 	}
 
-	return nil, ErrNotAuthenticated
+	return nil, "", ErrNotAuthenticated
 }
 
 // ListCachedTokens returns information about cached tokens for ctx's profile.
@@ -1051,24 +1120,99 @@ func (p *Plugin) tokenCachePrefix(ctx context.Context) string {
 	return p.secretKey(ctx, secretSuffixTokenPrefix)
 }
 
-// validateStoredRefreshToken checks whether a stored refresh-token session is
-// valid without deleting credentials or populating the access-token cache,
-// while safely persisting any rotated refresh token returned by Google so a
-// one-time refresh grant is never lost.
-func (p *Plugin) validateStoredRefreshToken(ctx context.Context, cfg *Config, metadata *TokenMetadata, refreshToken string) error {
+// findUsableCachedUserToken inspects the profile's token cache without minting
+// and returns a usable, session-matching access token for refresh-token-less
+// interactive or device-code sessions.
+func (p *Plugin) findUsableCachedUserToken(ctx context.Context, metadata *TokenMetadata) (*auth.Token, error) {
+	hostClient := p.hostClient(ctx)
+	if hostClient == nil {
+		return nil, ErrNotAuthenticated
+	}
+	userFlow := metadata.Flow
+	if userFlow == "" {
+		userFlow = auth.FlowInteractive
+	}
 	storedClientID := metadata.ClientID
 	if storedClientID == "" {
 		storedClientID = DefaultADCClientID
 	}
+	cacheKey := buildCacheKey(userFlow, fingerprintHash(storedClientID), "")
+	cached, err := cacheGetWithPrefix(ctx, hostClient, p.tokenCachePrefix(ctx), cacheKey)
+	if err != nil {
+		return nil, err
+	}
+	if cached == nil || !cached.IsValidFor(DefaultMinValidFor) {
+		return nil, ErrNotAuthenticated
+	}
+	if metadata.SessionID != "" && cached.SessionID != metadata.SessionID {
+		return nil, ErrNotAuthenticated
+	}
+	return cached, nil
+}
 
-	if hostClient := p.hostClient(ctx); hostClient != nil {
-		cacheKey := buildCacheKey(metadata.Flow, fingerprintHash(storedClientID), "")
-		cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, p.tokenCachePrefix(ctx), cacheKey)
-		if cacheErr == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
-			if cached.SessionID == "" || cached.SessionID == metadata.SessionID {
-				return nil
+func (p *Plugin) hasValidCachedSessionToken(ctx context.Context, metadata *TokenMetadata) bool {
+	hostClient := p.hostClient(ctx)
+	if hostClient == nil {
+		return false
+	}
+	userFlow := metadata.Flow
+	if userFlow == "" {
+		userFlow = auth.FlowInteractive
+	}
+	storedClientID := metadata.ClientID
+	if storedClientID == "" {
+		storedClientID = DefaultADCClientID
+	}
+	cacheKey := buildCacheKey(userFlow, fingerprintHash(storedClientID), "")
+	cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, p.tokenCachePrefix(ctx), cacheKey)
+	if cacheErr != nil || cached == nil || !cached.IsValidFor(DefaultMinValidFor) {
+		return false
+	}
+	return cached.SessionID == "" || cached.SessionID == metadata.SessionID
+}
+
+// validateStoredRefreshToken checks whether a stored refresh-token session is
+// valid without deleting credentials or populating the access-token cache,
+// while serializing refresh-grant consumption with mintToken and safely
+// persisting any rotated refresh token returned by Google.
+func (p *Plugin) validateStoredRefreshToken(ctx context.Context, cfg *Config, metadata *TokenMetadata) error {
+	if p.hasValidCachedSessionToken(ctx, metadata) {
+		return nil
+	}
+
+	unlock, err := p.acquireRefreshLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	// Re-load stored credentials under refreshLock so any rotation or invalidation
+	// completed by a concurrent refresh is observed before probing Google.
+	curMeta, curRT, curHasRefresh, credErr := p.inspectStoredMetadataAndRefresh(ctx)
+	if credErr != nil {
+		if errors.Is(credErr, errMetadataNotFound) {
+			return ErrTokenExpired
+		}
+		return credErr
+	}
+	if !curHasRefresh || curRT == "" {
+		if curMeta != nil && isRefreshTokenFlow(curMeta.Flow) {
+			if _, cacheErr := p.findUsableCachedUserToken(ctx, curMeta); cacheErr != nil {
+				return ErrTokenExpired
 			}
 		}
+		return nil
+	}
+	metadata = curMeta
+	refreshToken := curRT
+
+	if p.hasValidCachedSessionToken(ctx, metadata) {
+		return nil
+	}
+
+	storedClientID := metadata.ClientID
+	if storedClientID == "" {
+		storedClientID = DefaultADCClientID
 	}
 
 	httpClient, err := p.httpClientForConfig(ctx, cfg)
@@ -1160,6 +1304,9 @@ func (p *Plugin) fetchUserinfoClaimsWithClient(ctx context.Context, httpClient H
 
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&userinfo); err != nil {
 		return nil, fmt.Errorf("failed to parse userinfo response: %w", err)
+	}
+	if strings.TrimSpace(userinfo.Subject) == "" {
+		return nil, fmt.Errorf("userinfo response missing sub claim")
 	}
 
 	username := ""

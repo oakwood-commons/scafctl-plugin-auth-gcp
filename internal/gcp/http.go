@@ -8,8 +8,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -79,6 +81,8 @@ type effectiveHTTPConfigKey struct {
 	circuitBreakerHalfOpenMaxRequests int
 	enableCompression                 bool
 	allowPrivateIPs                   bool
+	allowedPrivateCIDRs               string
+	trustProxyResolution              bool
 	maxResponseBodySize               int64
 }
 
@@ -91,8 +95,22 @@ func effectiveHTTPConfigKeyFromClientConfig(cfg *httpc.ClientConfig) effectiveHT
 		enableCache:          cfg.EnableCache,
 		enableCircuitBreaker: cfg.EnableCircuitBreaker,
 		enableCompression:    cfg.EnableCompression,
-		allowPrivateIPs:      cfg.AllowPrivateIPs,
 		maxResponseBodySize:  cfg.MaxResponseBodySize,
+	}
+	if cfg.IPPolicy != nil {
+		k.allowPrivateIPs = cfg.IPPolicy.AllowPrivate
+		if len(cfg.IPPolicy.AllowedCIDRs) > 0 && !cfg.IPPolicy.AllowPrivate {
+			cidrs := make([]string, 0, len(cfg.IPPolicy.AllowedCIDRs))
+			for _, n := range cfg.IPPolicy.AllowedCIDRs {
+				if n != nil {
+					cidrs = append(cidrs, n.String())
+				}
+			}
+			slices.Sort(cidrs)
+			cidrs = slices.Compact(cidrs)
+			k.allowedPrivateCIDRs = strings.Join(cidrs, ",")
+		}
+		k.trustProxyResolution = cfg.IPPolicy.TrustProxyResolution
 	}
 	if cfg.EnableCache {
 		k.cacheType = cfg.CacheType
@@ -195,9 +213,24 @@ func resolveEffectiveHTTPConfig(cfg *httpc.AppConfig) (effectiveHTTPConfigKey, *
 	if merged.EnableCompression != nil {
 		clientCfg.EnableCompression = *merged.EnableCompression
 	}
-	if merged.AllowPrivateIPs != nil {
-		clientCfg.AllowPrivateIPs = *merged.AllowPrivateIPs
+	var policy *httpc.IPPolicy
+	if merged.AllowPrivateIPs != nil && *merged.AllowPrivateIPs { //nolint:staticcheck // support deprecated AppConfig.AllowPrivateIPs alongside AllowedPrivateCIDRs
+		policy = httpc.AllowAllPrivateIPs()
 	}
+	if merged.AllowedPrivateCIDRs != nil {
+		p, err := httpc.NewIPPolicy(merged.AllowedPrivateCIDRs...)
+		if err != nil {
+			return effectiveHTTPConfigKey{}, nil, fmt.Errorf("invalid allowedPrivateCIDRs: %w", err)
+		}
+		policy = p
+	}
+	if merged.TrustProxyResolution != nil {
+		if policy == nil {
+			policy = &httpc.IPPolicy{}
+		}
+		policy.TrustProxyResolution = *merged.TrustProxyResolution
+	}
+	clientCfg.IPPolicy = policy
 	if merged.MaxResponseBodySize > 0 {
 		clientCfg.MaxResponseBodySize = merged.MaxResponseBodySize
 	}
@@ -225,6 +258,13 @@ func cloneResolvedClientConfig(baseCfg *httpc.ClientConfig, logger logr.Logger, 
 		cbCopy := *baseCfg.CircuitBreakerConfig
 		cfgCopy.CircuitBreakerConfig = &cbCopy
 	}
+	if baseCfg.IPPolicy != nil {
+		policyCopy := *baseCfg.IPPolicy
+		if baseCfg.IPPolicy.AllowedCIDRs != nil {
+			policyCopy.AllowedCIDRs = append([]*net.IPNet(nil), baseCfg.IPPolicy.AllowedCIDRs...)
+		}
+		cfgCopy.IPPolicy = &policyCopy
+	}
 	cfgCopy.Logger = logger
 	cfgCopy.Transport = tr
 	return &cfgCopy
@@ -233,10 +273,13 @@ func cloneResolvedClientConfig(baseCfg *httpc.ClientConfig, logger logr.Logger, 
 // boundedClientCache is a concurrency-safe, size-bounded LRU cache of closable
 // HTTP clients. Evicted or cleared entries have Close() invoked outside the
 // cache mutex so idle transport connections and cache handles are released
-// without blocking concurrent lookups.
+// without blocking concurrent lookups. CloseAll is terminal: in-flight or
+// subsequent GetOrCreate calls reject insertion into a retired cache and close
+// any newly constructed candidate immediately.
 type boundedClientCache[K comparable, V io.Closer] struct {
 	mu       sync.Mutex
 	capacity int
+	closed   bool
 	store    map[K]*list.Element
 	order    *list.List
 }
@@ -257,25 +300,36 @@ func newBoundedClientCache[K comparable, V io.Closer](capacity int) *boundedClie
 	}
 }
 
-func (c *boundedClientCache[K, V]) GetOrCreate(key K, build func() V) V {
+func (c *boundedClientCache[K, V]) GetOrCreate(key K, build func() V) (V, bool) {
 	c.mu.Lock()
+	if c.closed {
+		var zero V
+		c.mu.Unlock()
+		return zero, false
+	}
 	if elem, ok := c.store[key]; ok {
 		c.order.MoveToFront(elem)
 		val := elem.Value.(*clientCacheEntry[K, V]).value
 		c.mu.Unlock()
-		return val
+		return val, true
 	}
 	c.mu.Unlock()
 
 	candidate := build()
 
 	c.mu.Lock()
+	if c.closed {
+		var zero V
+		c.mu.Unlock()
+		_ = candidate.Close()
+		return zero, false
+	}
 	if elem, ok := c.store[key]; ok {
 		c.order.MoveToFront(elem)
 		winner := elem.Value.(*clientCacheEntry[K, V]).value
 		c.mu.Unlock()
 		_ = candidate.Close()
-		return winner
+		return winner, true
 	}
 
 	elem := c.order.PushFront(&clientCacheEntry[K, V]{key: key, value: candidate})
@@ -297,7 +351,7 @@ func (c *boundedClientCache[K, V]) GetOrCreate(key K, build func() V) V {
 	if hasEvicted {
 		_ = evicted.Close()
 	}
-	return candidate
+	return candidate, true
 }
 
 func (c *boundedClientCache[K, V]) Len() int {
@@ -314,11 +368,16 @@ func (c *boundedClientCache[K, V]) CloseAll() {
 		return
 	}
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
 	toClose := make([]V, 0, c.order.Len())
 	for elem := c.order.Front(); elem != nil; elem = elem.Next() {
 		toClose = append(toClose, elem.Value.(*clientCacheEntry[K, V]).value)
 	}
-	c.store = make(map[K]*list.Element, c.capacity)
+	c.store = nil
 	c.order.Init()
 	c.mu.Unlock()
 

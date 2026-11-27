@@ -9,11 +9,13 @@ package gcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -115,7 +117,9 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 		return nil, fmt.Errorf("generating OAuth state: %w", err)
 	}
 
-	// Start local callback server with deferred completion and Blueprint HTML pages
+	// Start local callback server on a dedicated background context so callback
+	// settlement is serialized through callbackCommitGate rather than racing
+	// oauth-helpers' internal context.AfterFunc during credential commit.
 	callbackOpts := []oauth.CallbackOption{oauth.WithDeferredCompletion()}
 	if pages := p.callbackPages(); pages != nil {
 		callbackOpts = append(callbackOpts, oauth.WithCallbackPages(oauth.CallbackPages{
@@ -124,11 +128,16 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 		}))
 	}
 
+	cbCtx, cancelCB := context.WithCancel(context.Background())
+	defer cancelCB()
+
 	callbackPort := normalizeCallbackPort(req.CallbackPort)
-	callbackServer, err := oauth.StartCallbackServer(ctx, callbackPort, state, callbackOpts...)
+	callbackServer, err := oauth.StartCallbackServer(cbCtx, callbackPort, state, callbackOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("starting callback server: %w", err)
 	}
+
+	gate := &callbackCommitGate{server: callbackServer}
 
 	drained := false
 	drainCallbackServer := func() {
@@ -136,14 +145,18 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 			return
 		}
 		drained = true
+		gate.settleFailure()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), callbackShutdownTimeout)
 		defer shutdownCancel()
 		_ = callbackServer.Shutdown(shutdownCtx)
 	}
 	defer drainCallbackServer()
 
-	settleCallback := func(success bool) {
-		callbackServer.Complete(success)
+	stopCancelWatch := context.AfterFunc(ctx, gate.settleFailure)
+	defer stopCancelWatch()
+
+	settleCallbackFailure := func() {
+		gate.settleFailure()
 		drainCallbackServer()
 	}
 
@@ -195,10 +208,10 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 		authCode = result.Code
 		lgr.V(1).Info("received authorization code")
 	case <-timer.C:
-		settleCallback(false)
+		settleCallbackFailure()
 		return nil, fmt.Errorf("authentication timed out: no response received from browser: %w", ErrTimeout)
 	case <-ctx.Done():
-		settleCallback(false)
+		settleCallbackFailure()
 		return nil, fmt.Errorf("authentication cancelled: %w", ErrUserCancelled)
 	}
 
@@ -215,7 +228,7 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 
 	resp, err := httpClient.PostForm(ctx, tokenEndpoint, data)
 	if err != nil {
-		settleCallback(false)
+		settleCallbackFailure()
 		return nil, fmt.Errorf("token exchange failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -223,7 +236,7 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 	if resp.StatusCode != http.StatusOK {
 		var errResp TokenErrorResponse
 		_ = json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&errResp)
-		settleCallback(false)
+		settleCallbackFailure()
 		if errResp.Error != "" {
 			return nil, fmt.Errorf("token exchange failed: %s - %s",
 				sanitizeControlChars(errResp.Error), sanitizeControlChars(errResp.ErrorDescription))
@@ -233,34 +246,35 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 
 	var tokenResp TokenResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&tokenResp); err != nil {
-		settleCallback(false)
+		settleCallbackFailure()
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
 	if tokenResp.AccessToken == "" {
-		settleCallback(false)
+		settleCallbackFailure()
 		return nil, fmt.Errorf("token exchange failed: token endpoint returned empty access_token")
 	}
 
-	// Validate and extract claims before mutating stored credentials so a
-	// malformed ID token serves FailureHTML without leaving partial state.
+	// Validate and extract claims before mutating stored credentials so an
+	// invalid ID token or failed userinfo lookup serves FailureHTML without
+	// overwriting any previously authenticated session.
 	var claims *auth.Claims
 	if tokenResp.IDToken != "" {
 		claims, err = validateAndExtractIDTokenClaims(tokenResp.IDToken, clientID, time.Now())
 		if err != nil {
-			settleCallback(false)
+			settleCallbackFailure()
 			return nil, fmt.Errorf("failed to extract claims from ID token: %w", err)
 		}
 	} else {
 		claims, err = p.fetchUserinfoClaimsWithClient(ctx, httpClient, tokenResp.AccessToken)
 		if err != nil {
+			settleCallbackFailure()
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, fmt.Errorf("authentication timed out: %w", ErrTimeout)
+			}
 			if ctx.Err() != nil {
-				settleCallback(false)
-				if ctx.Err() == context.DeadlineExceeded {
-					return nil, fmt.Errorf("authentication timed out: %w", ErrTimeout)
-				}
 				return nil, fmt.Errorf("authentication cancelled: %w", ErrUserCancelled)
 			}
-			claims = &auth.Claims{Issuer: "https://accounts.google.com"}
+			return nil, fmt.Errorf("failed to fetch userinfo claims: %w", err)
 		}
 	}
 
@@ -276,15 +290,21 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 		Flow:        auth.FlowInteractive,
 	}
 
-	// Atomically commit credentials, clear stale cached tokens, and seed the new
-	// access token under the profile write lock before settling SuccessHTML.
-	_, err = p.storeCredentialsAndSeedToken(ctx, cfg, &tokenResp, auth.FlowInteractive, scopes, "", clientID, claims, initialCacheKey, initialToken)
+	// Atomically stage credentials and access-token seed under the profile write
+	// lock and coordinate callback settlement via gate.trySettleSuccess: if ctx
+	// cancellation won at any point (including during the detached legacy-mirror
+	// write), staged writes are rolled back to the prior session snapshot and
+	// FailureHTML matches the returned cancellation error.
+	_, err = p.storeCredentialsAndSeedTokenWithHook(ctx, cfg, &tokenResp, auth.FlowInteractive, scopes, "", clientID, claims, initialCacheKey, initialToken, gate.trySettleSuccess)
 	if err != nil {
-		settleCallback(false)
+		settleCallbackFailure()
+		if errors.Is(err, ErrTimeout) || errors.Is(err, ErrUserCancelled) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("failed to store credentials: %w", err)
 	}
 
-	settleCallback(true)
+	drainCallbackServer()
 
 	lgr.V(1).Info("ADC browser OAuth flow completed successfully",
 		"email", claims.Email,
@@ -297,23 +317,74 @@ func (p *Plugin) adcLogin(ctx context.Context, req sdkplugin.LoginRequest, devic
 	}, nil
 }
 
-// mintToken creates a new access token using the stored refresh token.
+// callbackCommitGate linearizes cancellation against localhost OAuth callback
+// completion so browser HTTP status (200 SuccessHTML vs 503 FailureHTML) always
+// matches whether the login session committed or rolled back.
+type callbackCommitGate struct {
+	mu      sync.Mutex
+	server  *oauth.CallbackServer
+	settled bool
+}
+
+func (g *callbackCommitGate) settleFailure() {
+	g.mu.Lock()
+	if !g.settled {
+		g.settled = true
+		g.server.Complete(false)
+	}
+	g.mu.Unlock()
+}
+
+func (g *callbackCommitGate) trySettleSuccess(ctx context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.settled || ctx.Err() != nil {
+		if !g.settled {
+			g.settled = true
+			g.server.Complete(false)
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("authentication timed out: %w", ErrTimeout)
+		}
+		return fmt.Errorf("authentication cancelled: %w", ErrUserCancelled)
+	}
+	g.settled = true
+	g.server.Complete(true)
+	return nil
+}
+
+// mintToken creates a new access token using the stored refresh token,
+// serializing refresh-grant consumption for ctx's profile without holding
+// profileLock across external HTTP calls.
 func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, error) {
+	unlock, err := p.acquireRefreshLock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	token, _, err := p.mintTokenLocked(ctx, scope)
+	return token, err
+}
+
+// mintTokenLocked performs a single refresh-token exchange while the caller
+// holds acquireRefreshLock(ctx).
+func (p *Plugin) mintTokenLocked(ctx context.Context, scope string) (*auth.Token, string, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("minting access token", "scope", scope)
 
 	cfg, err := p.effectiveConfig(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	httpClient, err := p.httpClientForConfig(ctx, cfg)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	refreshToken, metadata, err := p.loadSessionCredentials(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// For ADC flow, use the stored client ID as primary source, then fall
@@ -341,7 +412,7 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 
 	resp, err := httpClient.PostForm(ctx, tokenEndpoint, data)
 	if err != nil {
-		return nil, fmt.Errorf("token refresh failed: %w", err)
+		return nil, "", fmt.Errorf("token refresh failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -352,29 +423,30 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 		bin := p.binaryName()
 		if errResp.Error == "invalid_grant" {
 			p.logoutIfRefreshRevisionMatches(ctx, metadata.SessionID, metadata.RefreshTokenID, metadata.RefreshTokenHash, refreshToken)
-			return nil, fmt.Errorf(
+			return nil, "", fmt.Errorf(
 				"GCP credentials have expired or been revoked (%s). "+
 					"Run: %s auth login %s: %w",
 				sanitizeControlChars(errResp.ErrorDescription), bin, HandlerName, ErrTokenExpired)
 		}
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"token refresh failed: %s - %s. Run: %s auth login %s to re-authenticate",
 			sanitizeControlChars(errResp.Error), sanitizeControlChars(errResp.ErrorDescription), bin, HandlerName)
 	}
 
 	var tokenResp TokenResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w", err)
+		return nil, "", fmt.Errorf("failed to parse token response: %w", err)
 	}
 	if tokenResp.AccessToken == "" {
-		return nil, fmt.Errorf("token refresh failed: token endpoint returned empty access_token")
+		return nil, "", fmt.Errorf("token refresh failed: token endpoint returned empty access_token")
 	}
 
-	// Handle refresh token rotation unless a concurrent login or refresh replaced the revision
+	// Persist rotated refresh tokens before returning or caching the access token
+	// so callers detect storage failures before relying on a superseded grant.
 	if tokenResp.RefreshToken != "" && tokenResp.RefreshToken != refreshToken {
 		lgr.V(1).Info("refresh token rotated, storing new token")
 		if storeErr := p.storeRotatedCredentials(ctx, cfg, &tokenResp, metadata, refreshToken, clientID); storeErr != nil {
-			lgr.V(1).Info("warning: failed to update refresh token", "error", storeErr)
+			return nil, "", fmt.Errorf("persisting rotated refresh token: %w", storeErr)
 		}
 	}
 
@@ -397,7 +469,7 @@ func (p *Plugin) mintToken(ctx context.Context, scope string) (*auth.Token, erro
 		Scope:       effectiveScope,
 		Flow:        userFlow,
 		SessionID:   metadata.SessionID,
-	}, nil
+	}, clientID, nil
 }
 
 // getStoredRefreshToken gets a token using the stored refresh token, with caching.
@@ -405,62 +477,97 @@ func (p *Plugin) getStoredRefreshToken(ctx context.Context, scope string, forceR
 	return p.getStoredRefreshTokenWithMinValidFor(ctx, scope, forceRefresh, DefaultMinValidFor)
 }
 
+func (p *Plugin) lookupCachedRefreshFlowToken(ctx context.Context, minValidFor time.Duration) (*auth.Token, string) {
+	hostClient := p.hostClient(ctx)
+	if hostClient == nil {
+		return nil, ""
+	}
+
+	mu := p.profileLock(ctx)
+	mu.RLock()
+	defer mu.RUnlock()
+
+	metadata, _, hasRefresh, err := p.inspectStoredMetadataAndRefreshUnlocked(ctx)
+	if err != nil || metadata == nil || !isRefreshTokenFlow(metadata.Flow) {
+		return nil, ""
+	}
+
+	userFlow := metadata.Flow
+	if userFlow == "" {
+		userFlow = auth.FlowInteractive
+	}
+	storedClientID := metadata.ClientID
+	if storedClientID == "" {
+		storedClientID = DefaultADCClientID
+	}
+	sessionID := metadata.SessionID
+
+	// Use empty scope in key because mintToken/refresh never passes scope to
+	// Google -- the token always covers all authorized scopes.
+	cacheKey := buildCacheKey(userFlow, fingerprintHash(storedClientID), "")
+	cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, p.tokenCachePrefix(ctx), cacheKey)
+	if cacheErr != nil || cached == nil || !cached.IsValidFor(minValidFor) {
+		return nil, ""
+	}
+	if !hasRefresh && sessionID != "" {
+		if cached.SessionID != sessionID {
+			return nil, ""
+		}
+	} else if cached.SessionID != "" && sessionID != "" && cached.SessionID != sessionID {
+		return nil, ""
+	}
+	if cached.Flow == "" {
+		cached.Flow = userFlow
+	}
+	if cached.SessionID == "" && sessionID != "" {
+		cached.SessionID = sessionID
+	}
+	return cached, storedClientID
+}
+
 func (p *Plugin) getStoredRefreshTokenWithMinValidFor(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
+	token, _, err := p.getStoredRefreshTokenWithIdentity(ctx, scope, forceRefresh, minValidFor)
+	return token, err
+}
+
+func (p *Plugin) getStoredRefreshTokenWithIdentity(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, string, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	if minValidFor <= 0 {
 		minValidFor = DefaultMinValidFor
 	}
 
-	var userFlow auth.Flow
-	var storedClientID string
-	var sessionID string
-	if metadata, err := p.loadMetadata(ctx); err == nil && metadata != nil {
-		userFlow = metadata.Flow
-		storedClientID = metadata.ClientID
-		sessionID = metadata.SessionID
-	}
-	if userFlow == "" {
-		userFlow = auth.FlowInteractive
-	}
-	if storedClientID == "" {
-		storedClientID = DefaultADCClientID
-	}
-
-	fingerprint := fingerprintHash(storedClientID)
-	prefix := p.tokenCachePrefix(ctx)
-
-	// Check cache first. Use empty scope in key because mintToken/refresh never
-	// passes scope to Google -- the token always covers all authorized scopes.
 	if !forceRefresh {
-		if hostClient := p.hostClient(ctx); hostClient != nil {
-			cacheKey := buildCacheKey(userFlow, fingerprint, "")
-			cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, prefix, cacheKey)
-			if cacheErr == nil && cached != nil && cached.IsValidFor(minValidFor) {
-				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
-					if cached.Flow == "" {
-						cached.Flow = userFlow
-					}
-					lgr.V(1).Info("using cached token", "scope", scope)
-					return cached, nil
-				}
-			}
+		if cached, cachedClientID := p.lookupCachedRefreshFlowToken(ctx, minValidFor); cached != nil {
+			lgr.V(1).Info("using cached token", "scope", scope)
+			return cached, cachedClientID, nil
 		}
 	}
 
-	token, err := p.mintToken(ctx, scope)
+	unlock, err := p.acquireRefreshLock(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	defer unlock()
+
+	// Re-check cache after acquiring refresh lock so concurrent callers coalesce
+	// onto the access token just minted by the preceding holder.
+	if !forceRefresh {
+		if cached, cachedClientID := p.lookupCachedRefreshFlowToken(ctx, minValidFor); cached != nil {
+			lgr.V(1).Info("using cached token", "scope", scope)
+			return cached, cachedClientID, nil
+		}
 	}
 
-	mintedClientID := storedClientID
-	if metadata, metaErr := p.loadMetadata(ctx); metaErr == nil && metadata != nil && metadata.ClientID != "" {
-		mintedClientID = metadata.ClientID
+	token, mintedClientID, err := p.mintTokenLocked(ctx, scope)
+	if err != nil {
+		return nil, "", err
 	}
+
 	cacheKey := buildCacheKey(token.Flow, fingerprintHash(mintedClientID), "")
 	p.cacheTokenForSession(ctx, cacheKey, token)
 
-	return token, nil
+	return token, mintedClientID, nil
 }
 
 // revokeRefreshToken revokes the stored refresh token with Google.

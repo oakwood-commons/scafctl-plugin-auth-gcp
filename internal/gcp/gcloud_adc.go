@@ -113,7 +113,7 @@ func LoadGcloudADCCredentials() (*GcloudADCCredentials, error) {
 		return nil, ErrNoGcloudADCConfigured
 	}
 
-	data, err := os.ReadFile(path) //nolint:gosec // G304: path is from well-known gcloud config location, not user input
+	data, err := readCredentialFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrNoGcloudADCConfigured
@@ -141,6 +141,20 @@ func LoadGcloudADCCredentials() (*GcloudADCCredentials, error) {
 func HasGcloudADCCredentials() bool {
 	_, err := LoadGcloudADCCredentials()
 	return err == nil
+}
+
+func gcloudADCSourceIdentity(creds *GcloudADCCredentials) string {
+	if creds == nil {
+		return ""
+	}
+	return creds.ClientID + "|" + fingerprintHash(creds.RefreshToken)
+}
+
+// gcloudADCFingerprint partitions gcloud ADC token cache entries by both OAuth
+// client ID and refresh-token fingerprint so switching accounts in gcloud's
+// ADC file never reuses a previous account's cached access token.
+func gcloudADCFingerprint(creds *GcloudADCCredentials) string {
+	return fingerprintHash(gcloudADCSourceIdentity(creds))
 }
 
 // gcloudADCLogin uses existing gcloud ADC credentials to authenticate.
@@ -225,7 +239,7 @@ func (p *Plugin) gcloudADCLogin(ctx context.Context, _ sdkplugin.LoginRequest) (
 	}
 
 	expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-	cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprintHash(creds.ClientID), scopeStr)
+	cacheKey := buildCacheKey(auth.FlowGcloudADC, gcloudADCFingerprint(creds), scopeStr)
 	initialToken := &auth.Token{
 		AccessToken: tokenResp.AccessToken,
 		TokenType:   tokenResp.TokenType,
@@ -254,6 +268,23 @@ func (p *Plugin) getGcloudADCToken(ctx context.Context, scope string, forceRefre
 }
 
 func (p *Plugin) getGcloudADCTokenWithMinValidFor(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
+	token, _, err := p.getGcloudADCTokenWithIdentity(ctx, scope, forceRefresh, minValidFor)
+	return token, err
+}
+
+func (p *Plugin) getGcloudADCTokenWithIdentity(ctx context.Context, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, string, error) {
+	creds, err := LoadGcloudADCCredentials()
+	if err != nil {
+		return nil, "", ErrNotAuthenticated
+	}
+	token, err := p.getGcloudADCTokenForCreds(ctx, creds, scope, forceRefresh, minValidFor)
+	if err != nil {
+		return nil, "", err
+	}
+	return token, gcloudADCSourceIdentity(creds), nil
+}
+
+func (p *Plugin) getGcloudADCTokenForCreds(ctx context.Context, creds *GcloudADCCredentials, scope string, forceRefresh bool, minValidFor time.Duration) (*auth.Token, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	if minValidFor <= 0 {
@@ -269,12 +300,7 @@ func (p *Plugin) getGcloudADCTokenWithMinValidFor(ctx context.Context, scope str
 		return nil, err
 	}
 
-	creds, err := LoadGcloudADCCredentials()
-	if err != nil {
-		return nil, ErrNotAuthenticated
-	}
-
-	fingerprint := fingerprintHash(creds.ClientID)
+	fingerprint := gcloudADCFingerprint(creds)
 	prefix := p.tokenCachePrefix(ctx)
 	sessionID := p.readFlowSessionID(ctx, auth.FlowGcloudADC, "")
 	cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprint, scope)
@@ -287,6 +313,9 @@ func (p *Plugin) getGcloudADCTokenWithMinValidFor(ctx context.Context, scope str
 				if cached.SessionID == "" || sessionID == "" || cached.SessionID == sessionID {
 					if cached.Flow == "" {
 						cached.Flow = auth.FlowGcloudADC
+					}
+					if cached.SessionID == "" && sessionID != "" {
+						cached.SessionID = sessionID
 					}
 					lgr.V(1).Info("using cached gcloud ADC token", "scope", scope)
 					return cached, nil
@@ -355,7 +384,7 @@ func (p *Plugin) validateGcloudADCCredentials(ctx context.Context) error {
 
 	// Check cache first (read-only, no side effect).
 	if hostClient := p.hostClient(ctx); hostClient != nil {
-		cacheKey := buildCacheKey(auth.FlowGcloudADC, fingerprintHash(creds.ClientID), defaultGcloudADCScope)
+		cacheKey := buildCacheKey(auth.FlowGcloudADC, gcloudADCFingerprint(creds), defaultGcloudADCScope)
 		cached, cacheErr := cacheGetWithPrefix(ctx, hostClient, p.tokenCachePrefix(ctx), cacheKey)
 		if cacheErr == nil && cached != nil && cached.IsValidFor(DefaultMinValidFor) {
 			return nil
