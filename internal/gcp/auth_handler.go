@@ -974,10 +974,12 @@ func (p *Plugin) PurgeExpiredTokens(ctx context.Context, handlerName string) (in
 	return cachePurgeExpiredWithPrefix(ctx, hostClient, p.tokenCachePrefix(ctx))
 }
 
-// DetectAvailableFlows reports which flows have pre-existing environment or configured credentials,
-// ordered to match Login / GetStatus / GetToken auto-detection precedence.
-// Authoritative errors on explicitly configured credential files are returned directly so the
-// host fails closed rather than auto-selecting a lower-priority ambient flow.
+// DetectAvailableFlows reports available authentication flows ordered to match
+// Login auto-detection precedence so no-flag CLI logins select explicit machine
+// credentials first, then interactive browser OAuth on workstations ahead of
+// ambient gcloud ADC credentials. Authoritative errors on explicitly configured
+// credential files are returned directly so the host fails closed rather than
+// auto-selecting a lower-priority flow.
 func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) ([]sdkplugin.FlowAvailability, error) {
 	if handlerName != HandlerName {
 		return nil, fmt.Errorf("unknown handler: %s", handlerName)
@@ -1030,7 +1032,14 @@ func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) (
 		})
 	}
 
-	// 4. gcloud ADC: validate credentials are actually usable before advertising the flow.
+	// 4. Interactive browser OAuth
+	flows = append(flows, sdkplugin.FlowAvailability{
+		Flow:      auth.FlowInteractive,
+		Available: true,
+		Reason:    "interactive browser OAuth flow is always available",
+	})
+
+	// 5. gcloud ADC: validate credentials are actually usable before advertising the flow.
 	adcCtx, adcCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer adcCancel()
 	if err := p.validateGcloudADCCredentials(adcCtx); err == nil {
@@ -1040,6 +1049,13 @@ func (p *Plugin) DetectAvailableFlows(ctx context.Context, handlerName string) (
 			Reason:    "gcloud application default credentials found",
 		})
 	}
+
+	// 6. Device code OAuth
+	flows = append(flows, sdkplugin.FlowAvailability{
+		Flow:      auth.FlowDeviceCode,
+		Available: true,
+		Reason:    "device code flow is available",
+	})
 
 	return flows, nil
 }

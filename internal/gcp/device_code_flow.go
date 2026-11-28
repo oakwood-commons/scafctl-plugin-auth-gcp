@@ -6,6 +6,7 @@ package gcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	oauth "github.com/oakwood-commons/oauth-helpers"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 )
@@ -215,75 +217,87 @@ func (p *Plugin) pollGCPDeviceToken(ctx context.Context, deviceCode *DeviceCodeR
 		return nil, err
 	}
 
-	interval := time.Duration(deviceCode.Interval) * time.Second
-	if interval < defaultDeviceCodePollInterval {
-		interval = defaultDeviceCodePollInterval
+	pollCfg := oauth.DevicePollConfig{
+		Interval:             time.Duration(deviceCode.Interval) * time.Second,
+		MinInterval:          defaultDeviceCodePollInterval,
+		SlowDownIncrement:    slowDownIncrement,
+		RetryTransientErrors: true,
+		Sleep:                p.getClock().Sleep,
+		OnSlowDown: func(newInterval time.Duration) {
+			lgr.V(1).Info("slow_down received, increasing poll interval", "newInterval", newInterval)
+		},
+		OnTransientError: func(transientErr error) {
+			lgr.V(1).Info("transient network error during device code poll, continuing", "error", transientErr)
+		},
 	}
 
-	ticker := p.getClock().NewTicker(interval)
-	defer ticker.Stop()
+	tokenResp, err := oauth.PollDeviceToken(ctx, pollCfg, func(pollCtx context.Context) (*TokenResponse, *oauth.DevicePollError, error) {
+		data := url.Values{}
+		data.Set("client_id", clientID)
+		if clientSecret != "" {
+			data.Set("client_secret", clientSecret)
+		}
+		data.Set("device_code", deviceCode.DeviceCode)
+		data.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 
-	for {
-		select {
-		case <-ctx.Done():
-			if ctx.Err() == context.DeadlineExceeded {
-				return nil, fmt.Errorf("authentication timed out: %w", ErrTimeout)
-			}
+		resp, reqErr := httpClient.PostForm(pollCtx, tokenEndpoint, data)
+		if reqErr != nil {
+			return nil, nil, reqErr
+		}
+
+		var body struct {
+			TokenResponse
+			TokenErrorResponse
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&body)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return nil, &oauth.DevicePollError{
+				Cause: fmt.Errorf("failed to parse token response: %w", decodeErr),
+			}, nil
+		}
+
+		if body.AccessToken != "" {
+			return &TokenResponse{
+				AccessToken:  body.AccessToken,
+				RefreshToken: body.RefreshToken,
+				TokenType:    body.TokenType,
+				ExpiresIn:    body.ExpiresIn,
+				Scope:        body.Scope,
+				IDToken:      body.IDToken,
+			}, nil, nil
+		}
+
+		switch body.Error {
+		case "authorization_pending", "slow_down", "expired_token", "access_denied", "authorization_declined":
+			return nil, &oauth.DevicePollError{
+				Code:        body.Error,
+				Description: body.ErrorDescription,
+				Interval:    body.Interval,
+			}, nil
+		default:
+			return nil, &oauth.DevicePollError{
+				Code:        body.Error,
+				Description: body.ErrorDescription,
+				Cause: fmt.Errorf("token request failed: %s - %s",
+					sanitizeControlChars(body.Error), sanitizeControlChars(body.ErrorDescription)),
+			}, nil
+		}
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, oauth.ErrDeviceCodeExpired):
+			return nil, fmt.Errorf("device code expired, please try again: %w", ErrTimeout)
+		case errors.Is(err, oauth.ErrDeviceAccessDenied):
+			return nil, fmt.Errorf("user denied access: %w", ErrUserCancelled)
+		case errors.Is(err, context.DeadlineExceeded):
+			return nil, fmt.Errorf("authentication timed out: %w", ErrTimeout)
+		case errors.Is(err, context.Canceled):
 			return nil, fmt.Errorf("authentication cancelled: %w", ErrUserCancelled)
-		case <-ticker.C():
-			data := url.Values{}
-			data.Set("client_id", clientID)
-			if clientSecret != "" {
-				data.Set("client_secret", clientSecret)
-			}
-			data.Set("device_code", deviceCode.DeviceCode)
-			data.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
-
-			resp, err := httpClient.PostForm(ctx, tokenEndpoint, data)
-			if err != nil {
-				lgr.V(1).Info("transient network error during device code poll, continuing", "error", err)
-				continue
-			}
-
-			var body struct {
-				TokenResponse
-				TokenErrorResponse
-			}
-			if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseBytes)).Decode(&body); err != nil {
-				_ = resp.Body.Close()
-				return nil, fmt.Errorf("failed to parse token response: %w", err)
-			}
-			_ = resp.Body.Close()
-
-			// Success: access_token present
-			if body.AccessToken != "" {
-				return &TokenResponse{
-					AccessToken:  body.AccessToken,
-					RefreshToken: body.RefreshToken,
-					TokenType:    body.TokenType,
-					ExpiresIn:    body.ExpiresIn,
-					Scope:        body.Scope,
-					IDToken:      body.IDToken,
-				}, nil
-			}
-
-			// Handle polling errors per RFC 8628
-			switch body.Error {
-			case "authorization_pending":
-				continue
-			case "slow_down":
-				interval += slowDownIncrement
-				ticker.Reset(interval)
-				lgr.V(1).Info("slow_down received, increasing poll interval", "newInterval", interval)
-				continue
-			case "expired_token":
-				return nil, fmt.Errorf("device code expired, please try again: %w", ErrTimeout)
-			case "access_denied":
-				return nil, fmt.Errorf("user denied access: %w", ErrUserCancelled)
-			default:
-				return nil, fmt.Errorf("token request failed: %s - %s",
-					sanitizeControlChars(body.Error), sanitizeControlChars(body.ErrorDescription))
-			}
+		default:
+			return nil, err
 		}
 	}
+
+	return tokenResp, nil
 }

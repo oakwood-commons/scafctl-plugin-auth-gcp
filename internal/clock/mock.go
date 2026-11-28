@@ -3,10 +3,24 @@
 
 package clock
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
-// Mock is a test Clock whose tickers fire immediately without sleeping.
-type Mock struct{}
+// Mock is a test Clock whose operations complete without real delays unless
+// SleepFunc is set to observe or control sleep behavior.
+type Mock struct {
+	SleepFunc func(ctx context.Context, d time.Duration) error
+}
+
+// Sleep invokes SleepFunc when configured, or returns ctx.Err() immediately.
+func (m Mock) Sleep(ctx context.Context, d time.Duration) error {
+	if m.SleepFunc != nil {
+		return m.SleepFunc(ctx, d)
+	}
+	return ctx.Err()
+}
 
 // NewTicker returns a mock ticker whose channel is pre-filled so reads
 // never block. This is suitable for unit tests that need deterministic

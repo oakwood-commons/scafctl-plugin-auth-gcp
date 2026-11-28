@@ -62,6 +62,7 @@ type TokenResponse struct {
 type TokenErrorResponse struct {
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
+	Interval         int    `json:"interval,omitempty"`
 }
 
 // tokenCacheEntry is the JSON representation stored in the host secret store.
@@ -1107,7 +1108,7 @@ func cacheClearWithPrefix(ctx context.Context, lgr logr.Logger, hostClient *sdkp
 }
 
 func cacheClearExceptWithPrefix(ctx context.Context, lgr logr.Logger, hostClient *sdkplugin.HostServiceClient, prefix, keepFullKey string) {
-	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
+	keys, err := hostClient.ListSecretsByPrefix(ctx, prefix)
 	if err != nil {
 		lgr.V(1).Info("failed to list cached tokens", "error", err)
 		return
@@ -1128,7 +1129,7 @@ func cacheListEntries(ctx context.Context, hostClient *sdkplugin.HostServiceClie
 }
 
 func cacheListEntriesWithPrefix(ctx context.Context, hostClient *sdkplugin.HostServiceClient, prefix string) ([]*auth.CachedTokenInfo, error) {
-	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
+	keys, err := hostClient.ListSecretsByPrefix(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -1171,7 +1172,7 @@ func cachePurgeExpired(ctx context.Context, hostClient *sdkplugin.HostServiceCli
 }
 
 func cachePurgeExpiredWithPrefix(ctx context.Context, hostClient *sdkplugin.HostServiceClient, prefix string) (int, error) {
-	keys, err := hostClient.ListSecrets(ctx, prefix+"*")
+	keys, err := hostClient.ListSecretsByPrefix(ctx, prefix)
 	if err != nil {
 		return 0, err
 	}

@@ -1044,8 +1044,10 @@ func TestStatelessPerRPCSettingsAndProfiles(t *testing.T) {
 				})
 				assert.NoError(t, err)
 				assert.Empty(t, flowsResp.GetError())
-				if assert.Len(t, flowsResp.GetFlows(), 1) {
+				if assert.Len(t, flowsResp.GetFlows(), 3) {
 					assert.Equal(t, string(auth.FlowServicePrincipal), flowsResp.GetFlows()[0].GetFlow())
+					assert.Equal(t, string(auth.FlowInteractive), flowsResp.GetFlows()[1].GetFlow())
+					assert.Equal(t, string(auth.FlowDeviceCode), flowsResp.GetFlows()[2].GetFlow())
 				}
 
 				tok, err := grpcClient.GetToken(context.Background(), &proto.GetTokenRequest{
@@ -1067,8 +1069,10 @@ func TestStatelessPerRPCSettingsAndProfiles(t *testing.T) {
 				})
 				assert.NoError(t, err)
 				assert.Empty(t, flowsResp.GetError())
-				if assert.Len(t, flowsResp.GetFlows(), 1) {
+				if assert.Len(t, flowsResp.GetFlows(), 3) {
 					assert.Equal(t, string(auth.FlowWorkloadIdentity), flowsResp.GetFlows()[0].GetFlow())
+					assert.Equal(t, string(auth.FlowInteractive), flowsResp.GetFlows()[1].GetFlow())
+					assert.Equal(t, string(auth.FlowDeviceCode), flowsResp.GetFlows()[2].GetFlow())
 				}
 
 				tok, err := grpcClient.GetToken(context.Background(), &proto.GetTokenRequest{
@@ -1622,19 +1626,23 @@ func TestCredentialPrecedence_EnvFallbackAndFailClosed(t *testing.T) {
 
 		flows, err := p.DetectAvailableFlows(profSACtx, HandlerName)
 		require.NoError(t, err)
-		require.Len(t, flows, 2)
+		require.Len(t, flows, 4)
 		assert.Equal(t, auth.FlowServicePrincipal, flows[0].Flow, "service_principal must rank ahead of metadata")
 		assert.Equal(t, auth.FlowMetadata, flows[1].Flow)
+		assert.Equal(t, auth.FlowInteractive, flows[2].Flow)
+		assert.Equal(t, auth.FlowDeviceCode, flows[3].Flow)
 		assert.Contains(t, flows[0].Reason, "serviceAccountKeyFile")
 
-		// Without GOOGLE_APPLICATION_CREDENTIALS shadowing CLOUDSDK_CONFIG, all 3 rank in precedence order
+		// Without GOOGLE_APPLICATION_CREDENTIALS shadowing CLOUDSDK_CONFIG, all 5 rank in precedence order
 		t.Setenv(EnvGoogleApplicationCredentials, "")
 		flowsWithGcloud, err := p.DetectAvailableFlows(profSACtx, HandlerName)
 		require.NoError(t, err)
-		require.Len(t, flowsWithGcloud, 3)
+		require.Len(t, flowsWithGcloud, 5)
 		assert.Equal(t, auth.FlowServicePrincipal, flowsWithGcloud[0].Flow)
 		assert.Equal(t, auth.FlowMetadata, flowsWithGcloud[1].Flow)
-		assert.Equal(t, auth.FlowGcloudADC, flowsWithGcloud[2].Flow)
+		assert.Equal(t, auth.FlowInteractive, flowsWithGcloud[2].Flow)
+		assert.Equal(t, auth.FlowGcloudADC, flowsWithGcloud[3].Flow)
+		assert.Equal(t, auth.FlowDeviceCode, flowsWithGcloud[4].Flow)
 		t.Setenv(EnvGoogleApplicationCredentials, envSA)
 
 		// Empty profile serviceAccountKeyFile falls back to GOOGLE_APPLICATION_CREDENTIALS
