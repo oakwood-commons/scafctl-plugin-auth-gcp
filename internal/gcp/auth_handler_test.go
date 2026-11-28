@@ -3,13 +3,17 @@ package gcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/oakwood-commons/scafctl-plugin-sdk/auth"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
+	"github.com/oakwood-commons/scafctl-plugin-sdk/plugintest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -318,17 +322,99 @@ func TestPurgeExpiredTokens(t *testing.T) {
 }
 
 func TestDetectAvailableFlows(t *testing.T) {
-	t.Run("no credentials", func(t *testing.T) {
-		// Clear environment variables that DetectAvailableFlows checks
+	t.Run("no ambient credentials advertises interactive then device code", func(t *testing.T) {
 		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 		t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
-		t.Setenv("CLOUDSDK_CONFIG", t.TempDir()) // point to empty dir
+		t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
 		t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
 
 		p, _, _ := newTestPlugin(t)
 		flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
 		require.NoError(t, err)
-		assert.Empty(t, flows)
+		require.Len(t, flows, 2)
+		assert.Equal(t, auth.FlowInteractive, flows[0].Flow)
+		assert.True(t, flows[0].Available)
+		assert.Equal(t, auth.FlowDeviceCode, flows[1].Flow)
+		assert.True(t, flows[1].Available)
+	})
+
+	t.Run("valid gcloud ADC ranks behind interactive while explicit login and ambient fallback work", func(t *testing.T) {
+		adcDir := t.TempDir()
+		t.Setenv("CLOUDSDK_CONFIG", adcDir)
+		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+		t.Setenv("GOOGLE_EXTERNAL_ACCOUNT", "")
+		t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
+
+		adcCreds := GcloudADCCredentials{
+			ClientID:     "gcloud-client-id",
+			ClientSecret: "gcloud-client-secret",
+			RefreshToken: "gcloud-refresh-token",
+			Type:         "authorized_user",
+		}
+		adcBytes, err := json.Marshal(adcCreds)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(adcDir, "application_default_credentials.json"), adcBytes, 0o600))
+
+		p, _, mockHTTP := newTestPlugin(t)
+		// 1) DetectAvailableFlows probe
+		mockHTTP.AddResponse(200, TokenResponse{
+			AccessToken: "gcloud-probe-token",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+		// 2) Logged-out GetStatus ambient fallback probe
+		mockHTTP.AddResponse(200, TokenResponse{
+			AccessToken: "gcloud-status-token",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+		// 3) Logged-out GetToken ambient fallback (populates cache)
+		mockHTTP.AddResponse(200, TokenResponse{
+			AccessToken: "gcloud-fallback-token",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+		// 4) Explicit Login with FlowGcloudADC (refresh + userinfo)
+		mockHTTP.AddResponse(200, TokenResponse{
+			AccessToken: "gcloud-login-token",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+		mockHTTP.AddResponse(200, map[string]string{
+			"sub":   "user-123",
+			"email": "user@example.com",
+		})
+
+		flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
+		require.NoError(t, err)
+		require.Len(t, flows, 3)
+		assert.Equal(t, auth.FlowInteractive, flows[0].Flow, "interactive must rank ahead of ambient gcloud_adc")
+		assert.True(t, flows[0].Available)
+		assert.Equal(t, auth.FlowGcloudADC, flows[1].Flow)
+		assert.True(t, flows[1].Available)
+		assert.Equal(t, auth.FlowDeviceCode, flows[2].Flow)
+		assert.True(t, flows[2].Available)
+
+		// Ambient GetStatus and GetToken fallback remain functional when logged out
+		st, err := p.GetStatus(context.Background(), HandlerName, sdkplugin.StatusRequest{})
+		require.NoError(t, err)
+		assert.True(t, st.Authenticated)
+		assert.Equal(t, auth.FlowGcloudADC, st.Flow)
+
+		tok, err := p.GetToken(context.Background(), HandlerName, sdkplugin.TokenRequest{
+			Scope: "https://www.googleapis.com/auth/cloud-platform",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "gcloud-fallback-token", tok.AccessToken)
+		assert.Equal(t, auth.FlowGcloudADC, tok.Flow)
+
+		// Explicit --flow gcloud-adc login continues to work
+		loginResp, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+			Flow: auth.FlowGcloudADC,
+		}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, loginResp.Claims)
+		assert.Equal(t, "user@example.com", loginResp.Claims.Email)
 	})
 
 	t.Run("impersonation configured does not add a flow", func(t *testing.T) {
@@ -342,7 +428,7 @@ func TestDetectAvailableFlows(t *testing.T) {
 
 		flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
 		require.NoError(t, err)
-
+		require.Len(t, flows, 2)
 		for _, f := range flows {
 			assert.NotEqual(t, auth.Flow("impersonation"), f.Flow, "impersonation should not appear as a standalone flow")
 		}
@@ -374,7 +460,7 @@ func TestDetectAvailableFlows(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, os.WriteFile(filepath.Join(adcDir, "application_default_credentials.json"), adcBytes, 0o600))
 
-		// Token endpoint returns RAPT error → credentials are invalid.
+		// Token endpoint returns RAPT error -> credentials are invalid.
 		mockHTTP.AddResponse(400, TokenErrorResponse{
 			Error:            "invalid_grant",
 			ErrorDescription: "reauth related error (invalid_rapt)",
@@ -382,10 +468,11 @@ func TestDetectAvailableFlows(t *testing.T) {
 
 		flows, err := p.DetectAvailableFlows(context.Background(), HandlerName)
 		require.NoError(t, err)
-
-		// gcloud-adc should NOT appear since validation failed.
+		require.Len(t, flows, 2)
+		assert.Equal(t, auth.FlowInteractive, flows[0].Flow)
+		assert.Equal(t, auth.FlowDeviceCode, flows[1].Flow)
 		for _, f := range flows {
-			assert.NotEqual(t, auth.FlowGcloudADC, auth.Flow(f.Flow),
+			assert.NotEqual(t, auth.FlowGcloudADC, f.Flow,
 				"gcloud-adc flow should not be reported when credentials are invalid")
 		}
 	})
@@ -448,6 +535,18 @@ func TestDeviceCodeLogin(t *testing.T) {
 func TestDeviceCodeLogin_Timeout(t *testing.T) {
 	p, _, mockHTTP := newTestPlugin(t)
 
+	var sleepCalls int
+	p.clock = clock.Mock{
+		SleepFunc: func(ctx context.Context, _ time.Duration) error {
+			sleepCalls++
+			if sleepCalls == 1 {
+				return nil
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
 	// Mock device code response
 	mockHTTP.AddResponse(200, DeviceCodeResponse{
 		DeviceCode:      "test-device-code",
@@ -456,22 +555,254 @@ func TestDeviceCodeLogin_Timeout(t *testing.T) {
 		ExpiresIn:       1,
 		Interval:        5,
 	})
+	mockHTTP.AddResponse(200, map[string]string{
+		"error": "authorization_pending",
+	})
 
-	// Mock pending responses
-	for range 100 {
-		mockHTTP.AddResponse(200, map[string]string{
+	_, err := p.Login(context.Background(), HandlerName, sdkplugin.LoginRequest{
+		Flow:    auth.FlowDeviceCode,
+		Timeout: 20 * time.Millisecond,
+	}, nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTimeout)
+}
+
+type timeoutNetErr struct{}
+
+func (timeoutNetErr) Error() string   { return "request timeout" }
+func (timeoutNetErr) Timeout() bool   { return true }
+func (timeoutNetErr) Temporary() bool { return true }
+
+func TestPollGCPDeviceToken_PostResponseTimingAndErrors(t *testing.T) {
+	t.Run("waits interval plus 1s safety margin after each response and honors slow_down server interval", func(t *testing.T) {
+		p, _, mockHTTP := newTestPlugin(t)
+
+		var sleeps []time.Duration
+		p.clock = clock.Mock{
+			SleepFunc: func(_ context.Context, d time.Duration) error {
+				sleeps = append(sleeps, d)
+				return nil
+			},
+		}
+
+		// Poll 1: authorization_pending -> keeps base 5s (sleep 6s)
+		mockHTTP.AddResponse(400, map[string]any{
 			"error": "authorization_pending",
 		})
-	}
+		// Poll 2: transient non-timeout network error -> keeps base 5s (sleep 6s)
+		mockHTTP.AddError(errors.New("temporary connection reset"))
+		// Poll 3: slow_down without server interval -> 5s + 5s = 10s (sleep 11s)
+		mockHTTP.AddResponse(400, map[string]any{
+			"error": "slow_down",
+		})
+		// Poll 4: slow_down with larger server interval (20s > 10s + 5s) -> 20s (sleep 21s)
+		mockHTTP.AddResponse(400, map[string]any{
+			"error":    "slow_down",
+			"interval": 20,
+		})
+		// Poll 5: timeout network error -> doubles 20s to 40s (sleep 41s)
+		mockHTTP.AddError(timeoutNetErr{})
+		// Poll 6: success
+		mockHTTP.AddResponse(200, TokenResponse{
+			AccessToken:  "device-access-token",
+			RefreshToken: "device-refresh-token",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+			Scope:        "openid email",
+		})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
+		resp, err := p.pollGCPDeviceToken(context.Background(), &DeviceCodeResponse{
+			DeviceCode: "dc-1",
+			Interval:   2, // clamped up to 5s minimum
+		}, "custom-client", "custom-secret")
+		require.NoError(t, err)
+		assert.Equal(t, "device-access-token", resp.AccessToken)
+		assert.Equal(t, "device-refresh-token", resp.RefreshToken)
+		assert.Equal(t, []time.Duration{
+			6 * time.Second,
+			6 * time.Second,
+			6 * time.Second,
+			11 * time.Second,
+			21 * time.Second,
+			41 * time.Second,
+		}, sleeps)
+	})
 
-	_, err := p.Login(ctx, HandlerName, sdkplugin.LoginRequest{
-		Flow:    auth.FlowDeviceCode,
-		Timeout: 100 * time.Millisecond,
-	}, nil)
-	assert.Error(t, err)
+	t.Run("context cancelled maps to ErrUserCancelled", func(t *testing.T) {
+		p, _, _ := newTestPlugin(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := p.pollGCPDeviceToken(ctx, &DeviceCodeResponse{DeviceCode: "dc", Interval: 5}, "cid", "")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrUserCancelled)
+		assert.Contains(t, err.Error(), "authentication cancelled")
+	})
+
+	t.Run("terminal OAuth error preserves sanitized message", func(t *testing.T) {
+		p, _, mockHTTP := newTestPlugin(t)
+		mockHTTP.AddResponse(400, TokenErrorResponse{
+			Error:            "invalid_client",
+			ErrorDescription: "bad client secret",
+		})
+
+		_, err := p.pollGCPDeviceToken(context.Background(), &DeviceCodeResponse{DeviceCode: "dc", Interval: 5}, "cid", "bad")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "token request failed: invalid_client - bad client secret")
+	})
+
+	t.Run("malformed JSON token response fails without retrying", func(t *testing.T) {
+		p, _, mockHTTP := newTestPlugin(t)
+		// Empty nil body decodes as EOF JSON parse failure.
+		mockHTTP.AddResponse(200, nil)
+
+		_, err := p.pollGCPDeviceToken(context.Background(), &DeviceCodeResponse{DeviceCode: "dc", Interval: 5}, "cid", "secret")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to parse token response")
+		assert.Len(t, mockHTTP.GetRequests(), 1)
+	})
+}
+
+func TestSecretPrefixRegexAndHostValidation(t *testing.T) {
+	t.Run("fakeHostService enforces host secret-name and regex rules", func(t *testing.T) {
+		fake := newFakeHostService()
+		hc := newFakeHostClient(fake)
+		ctx := context.Background()
+
+		invalidNames := []string{
+			"",
+			"..",
+			"scafctl..bad",
+			"bad:colon",
+			"bad/slash",
+			".leading-dot",
+			"-leading-dash",
+			strings.Repeat("a", 256),
+		}
+		for _, name := range invalidNames {
+			err := hc.SetSecret(ctx, name, "v")
+			assert.Errorf(t, err, "SetSecret must reject %q", name)
+
+			_, _, err = hc.GetSecret(ctx, name)
+			assert.Errorf(t, err, "GetSecret must reject %q", name)
+
+			err = hc.DeleteSecret(ctx, name)
+			assert.Errorf(t, err, "DeleteSecret must reject %q", name)
+		}
+
+		require.NoError(t, hc.SetSecret(ctx, "scafctl.auth.gcp.token.k1", "v1"))
+		require.NoError(t, hc.SetSecret(ctx, "other.scafctl.auth.gcp.token.k2", "v2"))
+
+		// Unanchored regex matches both; anchored regex matches only literal prefix.
+		unanchored, err := hc.ListSecrets(ctx, "scafctl\\.auth\\.gcp\\.token\\.")
+		require.NoError(t, err)
+		assert.Len(t, unanchored, 2)
+
+		prefixed, err := hc.ListSecretsByPrefix(ctx, SecretKeyTokenPrefix)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"scafctl.auth.gcp.token.k1"}, prefixed)
+
+		// Invalid regex and overlong pattern are rejected.
+		_, err = hc.ListSecrets(ctx, "[unterminated")
+		assert.Error(t, err)
+
+		_, err = hc.ListSecrets(ctx, strings.Repeat("a", sdkplugin.MaxHostSecretPatternLength+1))
+		assert.Error(t, err)
+	})
+
+	t.Run("token cache operations isolate literal prefix against plugintest.FakeHostService", func(t *testing.T) {
+		hc, hostFake := plugintest.NewFakeHostClient(t)
+		ctx := sdkplugin.WithHostClient(context.Background(), hc)
+
+		validJSON, err := json.Marshal(tokenCacheEntry{
+			AccessToken: "valid-at",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(time.Hour),
+			CachedAt:    time.Now(),
+			Flow:        auth.FlowInteractive,
+		})
+		require.NoError(t, err)
+		expiredJSON, err := json.Marshal(tokenCacheEntry{
+			AccessToken: "expired-at",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(-time.Hour),
+			CachedAt:    time.Now().Add(-2 * time.Hour),
+			Flow:        auth.FlowInteractive,
+		})
+		require.NoError(t, err)
+
+		// Populate real prefix keys alongside decoys that match unanchored or unescaped dot patterns.
+		decoys := map[string]string{
+			"other." + SecretKeyTokenPrefix + "decoy":   string(expiredJSON),
+			"scafctlXauthYgcpZtokenWdecoy":              string(expiredJSON),
+			"scafctl.auth.gcp.tokenXdecoy":              string(expiredJSON),
+			SecretKeyRefreshToken:                       "active-refresh-token",
+			"other.scafctl.auth.gcp.refresh_token.rev1": "other-rev",
+			"scafctl_auth_gcp_refresh_token_decoy":      "underscore-decoy",
+		}
+		for k, v := range decoys {
+			require.NoError(t, hostFake.PutSecret(k, v))
+		}
+		require.NoError(t, hostFake.PutSecret(SecretKeyTokenPrefix+"valid", string(validJSON)))
+		require.NoError(t, hostFake.PutSecret(SecretKeyTokenPrefix+"expired", string(expiredJSON)))
+
+		entries, err := cacheListEntries(ctx, hc)
+		require.NoError(t, err)
+		assert.Len(t, entries, 2, "cacheListEntries must ignore decoy keys")
+
+		purged, err := cachePurgeExpired(ctx, hc)
+		require.NoError(t, err)
+		assert.Equal(t, 1, purged, "cachePurgeExpired must purge only expired key under literal prefix")
+
+		cacheClearExceptWithPrefix(ctx, logr.Discard(), hc, SecretKeyTokenPrefix, SecretKeyTokenPrefix+"valid")
+		_, validStillExists := hostFake.Secret(SecretKeyTokenPrefix + "valid")
+		assert.True(t, validStillExists)
+
+		cacheClear(ctx, logr.Discard(), hc)
+		_, validAfterClear := hostFake.Secret(SecretKeyTokenPrefix + "valid")
+		assert.False(t, validAfterClear)
+
+		for k, want := range decoys {
+			got, ok := hostFake.Secret(k)
+			assert.Truef(t, ok, "decoy secret %q must remain untouched", k)
+			assert.Equalf(t, want, got, "decoy secret %q value must remain unchanged", k)
+		}
+	})
+
+	t.Run("ListSecretsByPrefix ignores out-of-prefix keys returned by host", func(t *testing.T) {
+		fake := newFakeHostService()
+		hc := newFakeHostClient(fake)
+		ctx := context.Background()
+
+		expiredJSON, _ := json.Marshal(tokenCacheEntry{
+			AccessToken: "exp",
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(-time.Hour),
+			CachedAt:    time.Now().Add(-2 * time.Hour),
+		})
+		fake.secrets["unrelated.secret"] = string(expiredJSON)
+		fake.secrets[SecretKeyTokenPrefix+"k1"] = string(expiredJSON)
+		fake.listSecretsFunc = func(_ context.Context, _ string) ([]string, bool, error) {
+			return []string{"unrelated.secret", SecretKeyTokenPrefix + "k1"}, true, nil
+		}
+
+		entries, err := cacheListEntriesWithPrefix(ctx, hc, SecretKeyTokenPrefix)
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+
+		purged, err := cachePurgeExpiredWithPrefix(ctx, hc, SecretKeyTokenPrefix)
+		require.NoError(t, err)
+		assert.Equal(t, 1, purged)
+		assert.NotEmpty(t, fake.secrets["unrelated.secret"])
+
+		fake.secrets[SecretKeyTokenPrefix+"k2"] = string(expiredJSON)
+		fake.listSecretsFunc = func(_ context.Context, _ string) ([]string, bool, error) {
+			return []string{"unrelated.secret", SecretKeyTokenPrefix + "k2"}, true, nil
+		}
+		cacheClearExceptWithPrefix(ctx, logr.Discard(), hc, SecretKeyTokenPrefix, "")
+		assert.NotEmpty(t, fake.secrets["unrelated.secret"])
+		assert.Empty(t, fake.secrets[SecretKeyTokenPrefix+"k2"])
+	})
 }
 
 func TestServiceAccountStatus(t *testing.T) {

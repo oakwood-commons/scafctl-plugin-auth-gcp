@@ -6,13 +6,19 @@
 // tests use Mock to advance time programmatically without sleeping.
 package clock
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Clock abstracts time operations so that tests can control time progression
 // without sleeping.
 type Clock interface {
 	// NewTicker returns a ticker that fires at the given interval.
 	NewTicker(d time.Duration) Ticker
+
+	// Sleep waits for d or until ctx is done.
+	Sleep(ctx context.Context, d time.Duration) error
 }
 
 // Ticker abstracts *time.Ticker so both real and mock implementations
@@ -34,6 +40,24 @@ type Real struct{}
 // NewTicker creates a real time.Ticker.
 func (Real) NewTicker(d time.Duration) Ticker {
 	return &realTicker{t: time.NewTicker(d)}
+}
+
+// Sleep waits for d or until ctx is done.
+func (Real) Sleep(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 type realTicker struct {

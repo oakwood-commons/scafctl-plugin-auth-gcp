@@ -13,6 +13,8 @@ Google Cloud Platform authentication handler plugin for scafctl.
 | `workload_identity` | Workload Identity Federation (STS token exchange) | Cross-cloud or OIDC-federated workloads |
 | `gcloud_adc` | Reads gcloud's cached ADC credentials | Fallback when gcloud is already authenticated |
 
+When no `--flow` flag is passed, login auto-detection checks `workload_identity`, `service_principal`, and `metadata` before defaulting to `interactive` browser OAuth; existing `gcloud` ADC credentials remain used as an ambient fallback when logged out or explicitly via `--flow gcloud-adc`.
+
 Service account impersonation (`impersonateServiceAccount`) can be combined with any credential source above to mint short-lived tokens via the IAM Credentials API.
 
 ## Configuration
@@ -114,6 +116,9 @@ scafctl auth login gcp --flow interactive --browser chrome
 
 # Pin the localhost OAuth callback port (e.g. for SSH port forwarding)
 scafctl auth login gcp --flow interactive --callback-port 8400
+
+# Authenticate explicitly using existing gcloud application default credentials
+scafctl auth login gcp --flow gcloud-adc
 ```
 
 ### Interactive OAuth Callback Pages
